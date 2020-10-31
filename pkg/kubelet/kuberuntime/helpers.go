@@ -18,23 +18,15 @@ package kuberuntime
 
 import (
 	"fmt"
+	"path/filepath"
 	"strconv"
+	"strings"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
-	runtimeApi "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"k8s.io/klog/v2"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-)
-
-const (
-	// Taken from lmctfy https://github.com/google/lmctfy/blob/master/lmctfy/controllers/cpu_controller.cc
-	minShares     = 2
-	sharesPerCPU  = 1024
-	milliCPUToCPU = 1000
-
-	// 100000 is equivalent to 100ms
-	quotaPeriod    = 100 * minQuotaPeriod
-	minQuotaPeriod = 1000
 )
 
 type podsByID []*kubecontainer.Pod
@@ -50,122 +42,252 @@ func (b containersByID) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
 func (b containersByID) Less(i, j int) bool { return b[i].ID.ID < b[j].ID.ID }
 
 // Newest first.
-type podSandboxByCreated []*runtimeApi.PodSandbox
+type podSandboxByCreated []*runtimeapi.PodSandbox
 
 func (p podSandboxByCreated) Len() int           { return len(p) }
 func (p podSandboxByCreated) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
-func (p podSandboxByCreated) Less(i, j int) bool { return p[i].GetCreatedAt() > p[j].GetCreatedAt() }
+func (p podSandboxByCreated) Less(i, j int) bool { return p[i].CreatedAt > p[j].CreatedAt }
 
-type containerStatusByCreated []*kubecontainer.ContainerStatus
+type containerStatusByCreated []*kubecontainer.Status
 
 func (c containerStatusByCreated) Len() int           { return len(c) }
 func (c containerStatusByCreated) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
 func (c containerStatusByCreated) Less(i, j int) bool { return c[i].CreatedAt.After(c[j].CreatedAt) }
 
-// toKubeContainerState converts runtimeApi.ContainerState to kubecontainer.ContainerState.
-func toKubeContainerState(state runtimeApi.ContainerState) kubecontainer.ContainerState {
+// toKubeContainerState converts runtimeapi.ContainerState to kubecontainer.State.
+func toKubeContainerState(state runtimeapi.ContainerState) kubecontainer.State {
 	switch state {
-	case runtimeApi.ContainerState_CREATED:
+	case runtimeapi.ContainerState_CONTAINER_CREATED:
 		return kubecontainer.ContainerStateCreated
-	case runtimeApi.ContainerState_RUNNING:
+	case runtimeapi.ContainerState_CONTAINER_RUNNING:
 		return kubecontainer.ContainerStateRunning
-	case runtimeApi.ContainerState_EXITED:
+	case runtimeapi.ContainerState_CONTAINER_EXITED:
 		return kubecontainer.ContainerStateExited
-	case runtimeApi.ContainerState_UNKNOWN:
+	case runtimeapi.ContainerState_CONTAINER_UNKNOWN:
 		return kubecontainer.ContainerStateUnknown
 	}
 
 	return kubecontainer.ContainerStateUnknown
 }
 
-// toRuntimeProtocol converts api.Protocol to runtimeApi.Protocol.
-func toRuntimeProtocol(protocol api.Protocol) runtimeApi.Protocol {
+// toRuntimeProtocol converts v1.Protocol to runtimeapi.Protocol.
+func toRuntimeProtocol(protocol v1.Protocol) runtimeapi.Protocol {
 	switch protocol {
-	case api.ProtocolTCP:
-		return runtimeApi.Protocol_TCP
-	case api.ProtocolUDP:
-		return runtimeApi.Protocol_UDP
+	case v1.ProtocolTCP:
+		return runtimeapi.Protocol_TCP
+	case v1.ProtocolUDP:
+		return runtimeapi.Protocol_UDP
+	case v1.ProtocolSCTP:
+		return runtimeapi.Protocol_SCTP
 	}
 
-	glog.Warningf("Unknown protocol %q: defaulting to TCP", protocol)
-	return runtimeApi.Protocol_TCP
+	klog.Warningf("Unknown protocol %q: defaulting to TCP", protocol)
+	return runtimeapi.Protocol_TCP
 }
 
-// toKubeContainer converts runtimeApi.Container to kubecontainer.Container.
-func (m *kubeGenericRuntimeManager) toKubeContainer(c *runtimeApi.Container) (*kubecontainer.Container, error) {
-	if c == nil || c.Id == nil || c.Image == nil || c.State == nil {
+// toKubeContainer converts runtimeapi.Container to kubecontainer.Container.
+func (m *kubeGenericRuntimeManager) toKubeContainer(c *runtimeapi.Container) (*kubecontainer.Container, error) {
+	if c == nil || c.Id == "" || c.Image == nil {
 		return nil, fmt.Errorf("unable to convert a nil pointer to a runtime container")
 	}
 
-	labeledInfo := getContainerInfoFromLabels(c.Labels)
 	annotatedInfo := getContainerInfoFromAnnotations(c.Annotations)
 	return &kubecontainer.Container{
-		ID:    kubecontainer.ContainerID{Type: m.runtimeName, ID: c.GetId()},
-		Name:  labeledInfo.ContainerName,
-		Image: c.Image.GetImage(),
-		Hash:  annotatedInfo.Hash,
-		State: toKubeContainerState(c.GetState()),
+		ID:      kubecontainer.ContainerID{Type: m.runtimeName, ID: c.Id},
+		Name:    c.GetMetadata().GetName(),
+		ImageID: c.ImageRef,
+		Image:   c.Image.Image,
+		Hash:    annotatedInfo.Hash,
+		State:   toKubeContainerState(c.State),
 	}, nil
 }
 
-// sandboxToKubeContainer converts runtimeApi.PodSandbox to kubecontainer.Container.
+// sandboxToKubeContainer converts runtimeapi.PodSandbox to kubecontainer.Container.
 // This is only needed because we need to return sandboxes as if they were
 // kubecontainer.Containers to avoid substantial changes to PLEG.
 // TODO: Remove this once it becomes obsolete.
-func (m *kubeGenericRuntimeManager) sandboxToKubeContainer(s *runtimeApi.PodSandbox) (*kubecontainer.Container, error) {
-	if s == nil || s.Id == nil || s.State == nil {
+func (m *kubeGenericRuntimeManager) sandboxToKubeContainer(s *runtimeapi.PodSandbox) (*kubecontainer.Container, error) {
+	if s == nil || s.Id == "" {
 		return nil, fmt.Errorf("unable to convert a nil pointer to a runtime container")
 	}
 
 	return &kubecontainer.Container{
-		ID:    kubecontainer.ContainerID{Type: m.runtimeName, ID: s.GetId()},
-		State: kubecontainer.SandboxToContainerState(s.GetState()),
+		ID:    kubecontainer.ContainerID{Type: m.runtimeName, ID: s.Id},
+		State: kubecontainer.SandboxToContainerState(s.State),
 	}, nil
 }
 
-// milliCPUToShares converts milliCPU to CPU shares
-func milliCPUToShares(milliCPU int64) int64 {
-	if milliCPU == 0 {
-		// Return 2 here to really match kernel default for zero milliCPU.
-		return minShares
+// getImageUser gets uid or user name that will run the command(s) from image. The function
+// guarantees that only one of them is set.
+func (m *kubeGenericRuntimeManager) getImageUser(image string) (*int64, string, error) {
+	imageStatus, err := m.imageService.ImageStatus(&runtimeapi.ImageSpec{Image: image})
+	if err != nil {
+		return nil, "", err
 	}
-	// Conceptually (milliCPU / milliCPUToCPU) * sharesPerCPU, but factored to improve rounding.
-	shares := (milliCPU * sharesPerCPU) / milliCPUToCPU
-	if shares < minShares {
-		return minShares
+
+	if imageStatus != nil {
+		if imageStatus.Uid != nil {
+			return &imageStatus.GetUid().Value, "", nil
+		}
+
+		if imageStatus.Username != "" {
+			return nil, imageStatus.Username, nil
+		}
 	}
-	return shares
+
+	// If non of them is set, treat it as root.
+	return new(int64), "", nil
 }
 
-// milliCPUToQuota converts milliCPU to CFS quota and period values
-func milliCPUToQuota(milliCPU int64) (quota int64, period int64) {
-	// CFS quota is measured in two values:
-	//  - cfs_period_us=100ms (the amount of time to measure usage across)
-	//  - cfs_quota=20ms (the amount of cpu time allowed to be used across a period)
-	// so in the above example, you are limited to 20% of a single CPU
-	// for multi-cpu environments, you just scale equivalent amounts
-	if milliCPU == 0 {
-		return
+// isInitContainerFailed returns true if container has exited and exitcode is not zero
+// or is in unknown state.
+func isInitContainerFailed(status *kubecontainer.Status) bool {
+	if status.State == kubecontainer.ContainerStateExited && status.ExitCode != 0 {
+		return true
 	}
 
-	// we set the period to 100ms by default
-	period = quotaPeriod
-
-	// we then convert your milliCPU to a value normalized over a period
-	quota = (milliCPU * quotaPeriod) / milliCPUToCPU
-
-	// quota needs to be a minimum of 1ms.
-	if quota < minQuotaPeriod {
-		quota = minQuotaPeriod
+	if status.State == kubecontainer.ContainerStateUnknown {
+		return true
 	}
 
-	return
+	return false
 }
 
 // getStableKey generates a key (string) to uniquely identify a
 // (pod, container) tuple. The key should include the content of the
 // container, so that any change to the container generates a new key.
-func getStableKey(pod *api.Pod, container *api.Container) string {
+func getStableKey(pod *v1.Pod, container *v1.Container) string {
 	hash := strconv.FormatUint(kubecontainer.HashContainer(container), 16)
 	return fmt.Sprintf("%s_%s_%s_%s_%s", pod.Name, pod.Namespace, string(pod.UID), container.Name, hash)
+}
+
+// logPathDelimiter is the delimiter used in the log path.
+const logPathDelimiter = "_"
+
+// buildContainerLogsPath builds log path for container relative to pod logs directory.
+func buildContainerLogsPath(containerName string, restartCount int) string {
+	return filepath.Join(containerName, fmt.Sprintf("%d.log", restartCount))
+}
+
+// BuildContainerLogsDirectory builds absolute log directory path for a container in pod.
+func BuildContainerLogsDirectory(podNamespace, podName string, podUID types.UID, containerName string) string {
+	return filepath.Join(BuildPodLogsDirectory(podNamespace, podName, podUID), containerName)
+}
+
+// BuildPodLogsDirectory builds absolute log directory path for a pod sandbox.
+func BuildPodLogsDirectory(podNamespace, podName string, podUID types.UID) string {
+	return filepath.Join(podLogsRootDirectory, strings.Join([]string{podNamespace, podName,
+		string(podUID)}, logPathDelimiter))
+}
+
+// parsePodUIDFromLogsDirectory parses pod logs directory name and returns the pod UID.
+// It supports both the old pod log directory /var/log/pods/UID, and the new pod log
+// directory /var/log/pods/NAMESPACE_NAME_UID.
+func parsePodUIDFromLogsDirectory(name string) types.UID {
+	parts := strings.Split(name, logPathDelimiter)
+	return types.UID(parts[len(parts)-1])
+}
+
+// toKubeRuntimeStatus converts the runtimeapi.RuntimeStatus to kubecontainer.RuntimeStatus.
+func toKubeRuntimeStatus(status *runtimeapi.RuntimeStatus) *kubecontainer.RuntimeStatus {
+	conditions := []kubecontainer.RuntimeCondition{}
+	for _, c := range status.GetConditions() {
+		conditions = append(conditions, kubecontainer.RuntimeCondition{
+			Type:    kubecontainer.RuntimeConditionType(c.Type),
+			Status:  c.Status,
+			Reason:  c.Reason,
+			Message: c.Message,
+		})
+	}
+	return &kubecontainer.RuntimeStatus{Conditions: conditions}
+}
+
+func fieldProfile(scmp *v1.SeccompProfile, profileRootPath string) string {
+	if scmp == nil {
+		return ""
+	}
+	if scmp.Type == v1.SeccompProfileTypeRuntimeDefault {
+		return v1.SeccompProfileRuntimeDefault
+	}
+	if scmp.Type == v1.SeccompProfileTypeLocalhost && scmp.LocalhostProfile != nil && len(*scmp.LocalhostProfile) > 0 {
+		fname := filepath.Join(profileRootPath, *scmp.LocalhostProfile)
+		return v1.SeccompLocalhostProfileNamePrefix + fname
+	}
+	if scmp.Type == v1.SeccompProfileTypeUnconfined {
+		return v1.SeccompProfileNameUnconfined
+	}
+	return ""
+}
+
+func annotationProfile(profile, profileRootPath string) string {
+	if strings.HasPrefix(profile, v1.SeccompLocalhostProfileNamePrefix) {
+		name := strings.TrimPrefix(profile, v1.SeccompLocalhostProfileNamePrefix)
+		fname := filepath.Join(profileRootPath, filepath.FromSlash(name))
+		return v1.SeccompLocalhostProfileNamePrefix + fname
+	}
+	return profile
+}
+
+func (m *kubeGenericRuntimeManager) getSeccompProfile(annotations map[string]string, containerName string,
+	podSecContext *v1.PodSecurityContext, containerSecContext *v1.SecurityContext) string {
+	// container fields are applied first
+	if containerSecContext != nil && containerSecContext.SeccompProfile != nil {
+		return fieldProfile(containerSecContext.SeccompProfile, m.seccompProfileRoot)
+	}
+
+	// if container field does not exist, try container annotation (deprecated)
+	if containerName != "" {
+		if profile, ok := annotations[v1.SeccompContainerAnnotationKeyPrefix+containerName]; ok {
+			return annotationProfile(profile, m.seccompProfileRoot)
+		}
+	}
+
+	// when container seccomp is not defined, try to apply from pod field
+	if podSecContext != nil && podSecContext.SeccompProfile != nil {
+		return fieldProfile(podSecContext.SeccompProfile, m.seccompProfileRoot)
+	}
+
+	// as last resort, try to apply pod annotation (deprecated)
+	if profile, ok := annotations[v1.SeccompPodAnnotationKey]; ok {
+		return annotationProfile(profile, m.seccompProfileRoot)
+	}
+
+	return ""
+}
+
+func ipcNamespaceForPod(pod *v1.Pod) runtimeapi.NamespaceMode {
+	if pod != nil && pod.Spec.HostIPC {
+		return runtimeapi.NamespaceMode_NODE
+	}
+	return runtimeapi.NamespaceMode_POD
+}
+
+func networkNamespaceForPod(pod *v1.Pod) runtimeapi.NamespaceMode {
+	if pod != nil && pod.Spec.HostNetwork {
+		return runtimeapi.NamespaceMode_NODE
+	}
+	return runtimeapi.NamespaceMode_POD
+}
+
+func pidNamespaceForPod(pod *v1.Pod) runtimeapi.NamespaceMode {
+	if pod != nil {
+		if pod.Spec.HostPID {
+			return runtimeapi.NamespaceMode_NODE
+		}
+		if pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
+			return runtimeapi.NamespaceMode_POD
+		}
+	}
+	// Note that PID does not default to the zero value for v1.Pod
+	return runtimeapi.NamespaceMode_CONTAINER
+}
+
+// namespacesForPod returns the runtimeapi.NamespaceOption for a given pod.
+// An empty or nil pod can be used to get the namespace defaults for v1.Pod.
+func namespacesForPod(pod *v1.Pod) *runtimeapi.NamespaceOption {
+	return &runtimeapi.NamespaceOption{
+		Ipc:     ipcNamespaceForPod(pod),
+		Network: networkNamespaceForPod(pod),
+		Pid:     pidNamespaceForPod(pod),
+	}
 }

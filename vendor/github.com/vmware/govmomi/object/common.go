@@ -17,6 +17,7 @@ limitations under the License.
 package object
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path"
@@ -26,11 +27,10 @@ import (
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
-	"golang.org/x/net/context"
 )
 
 var (
-	ErrNotSupported = errors.New("not supported (vCenter only)")
+	ErrNotSupported = errors.New("product/version specific feature not supported by target")
 )
 
 // Common contains the fields and functions common to all objects.
@@ -80,19 +80,27 @@ func (c *Common) SetInventoryPath(p string) {
 func (c Common) ObjectName(ctx context.Context) (string, error) {
 	var o mo.ManagedEntity
 
-	name := c.Name()
-	if name != "" {
-		return name, nil
-	}
-
 	err := c.Properties(ctx, c.Reference(), []string{"name"}, &o)
 	if err != nil {
 		return "", err
 	}
 
-	return o.Name, nil
+	if o.Name != "" {
+		return o.Name, nil
+	}
+
+	// Network has its own "name" field...
+	var n mo.Network
+
+	err = c.Properties(ctx, c.Reference(), []string{"name"}, &n)
+	if err != nil {
+		return "", err
+	}
+
+	return n.Name, nil
 }
 
+// Properties is a wrapper for property.DefaultCollector().RetrieveOne()
 func (c Common) Properties(ctx context.Context, r types.ManagedObjectReference, ps []string, dst interface{}) error {
 	return property.DefaultCollector(c.c).RetrieveOne(ctx, r, ps, dst)
 }
@@ -122,4 +130,15 @@ func (c Common) Rename(ctx context.Context, name string) (*Task, error) {
 	}
 
 	return NewTask(c.c, res.Returnval), nil
+}
+
+func (c Common) SetCustomValue(ctx context.Context, key string, value string) error {
+	req := types.SetCustomValue{
+		This:  c.Reference(),
+		Key:   key,
+		Value: value,
+	}
+
+	_, err := methods.SetCustomValue(ctx, c.c, &req)
+	return err
 }

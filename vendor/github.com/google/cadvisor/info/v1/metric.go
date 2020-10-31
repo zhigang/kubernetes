@@ -26,10 +26,7 @@ const (
 	MetricGauge MetricType = "gauge"
 
 	// A counter-like value that is only expected to increase.
-	MetricCumulative = "cumulative"
-
-	// Rate over a time period.
-	MetricDelta = "delta"
+	MetricCumulative MetricType = "cumulative"
 )
 
 // DataType for metric being exported.
@@ -37,7 +34,7 @@ type DataType string
 
 const (
 	IntType   DataType = "int"
-	FloatType          = "float"
+	FloatType DataType = "float"
 )
 
 // Spec for custom metric.
@@ -68,7 +65,8 @@ type MetricValBasic struct {
 // An exported metric.
 type MetricVal struct {
 	// Label associated with a metric
-	Label string `json:"label,omitempty"`
+	Label  string            `json:"label,omitempty"`
+	Labels map[string]string `json:"labels,omitempty"`
 
 	// Time at which the metric was queried
 	Timestamp time.Time `json:"timestamp"`

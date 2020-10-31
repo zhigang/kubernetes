@@ -3,6 +3,7 @@ package probing
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -60,8 +61,12 @@ func (p *prober) AddHTTP(id string, probingInterval time.Duration, endpoints []s
 					panic(err)
 				}
 				resp, err := p.tr.RoundTrip(req)
+				if err == nil && resp.StatusCode != http.StatusOK {
+					err = fmt.Errorf("got unexpected HTTP status code %s from %s", resp.Status, endpoints[pinned])
+					resp.Body.Close()
+				}
 				if err != nil {
-					s.recordFailure()
+					s.recordFailure(err)
 					pinned = (pinned + 1) % len(endpoints)
 					continue
 				}
@@ -71,7 +76,7 @@ func (p *prober) AddHTTP(id string, probingInterval time.Duration, endpoints []s
 				err = d.Decode(&hh)
 				resp.Body.Close()
 				if err != nil || !hh.OK {
-					s.recordFailure()
+					s.recordFailure(err)
 					pinned = (pinned + 1) % len(endpoints)
 					continue
 				}

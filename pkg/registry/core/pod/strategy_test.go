@@ -17,16 +17,33 @@ limitations under the License.
 package pod
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/url"
 	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/api/testapi"
+	"github.com/stretchr/testify/require"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/tools/cache"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	apitesting "k8s.io/kubernetes/pkg/api/testing"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/runtime"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/client"
+
+	// ensure types are installed
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
 )
 
 func TestMatchPod(t *testing.T) {
@@ -65,6 +82,34 @@ func TestMatchPod(t *testing.T) {
 		},
 		{
 			in: &api.Pod{
+				Spec: api.PodSpec{SchedulerName: "scheduler1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("spec.schedulerName=scheduler1"),
+			expectMatch:   true,
+		},
+		{
+			in: &api.Pod{
+				Spec: api.PodSpec{SchedulerName: "scheduler1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("spec.schedulerName=scheduler2"),
+			expectMatch:   false,
+		},
+		{
+			in: &api.Pod{
+				Spec: api.PodSpec{ServiceAccountName: "serviceAccount1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("spec.serviceAccountName=serviceAccount1"),
+			expectMatch:   true,
+		},
+		{
+			in: &api.Pod{
+				Spec: api.PodSpec{SchedulerName: "serviceAccount1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("spec.serviceAccountName=serviceAccount2"),
+			expectMatch:   false,
+		},
+		{
+			in: &api.Pod{
 				Status: api.PodStatus{Phase: api.PodRunning},
 			},
 			fieldSelector: fields.ParseSelectorOrDie("status.phase=Running"),
@@ -77,6 +122,64 @@ func TestMatchPod(t *testing.T) {
 			fieldSelector: fields.ParseSelectorOrDie("status.phase=Pending"),
 			expectMatch:   false,
 		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "1.2.3.4"},
+					},
+				},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.podIP=1.2.3.4"),
+			expectMatch:   true,
+		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "1.2.3.4"},
+					},
+				},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.podIP=4.3.2.1"),
+			expectMatch:   false,
+		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{NominatedNodeName: "node1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.nominatedNodeName=node1"),
+			expectMatch:   true,
+		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{NominatedNodeName: "node1"},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.nominatedNodeName=node2"),
+			expectMatch:   false,
+		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "2001:db8::"},
+					},
+				},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.podIP=2001:db8::"),
+			expectMatch:   true,
+		},
+		{
+			in: &api.Pod{
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "2001:db8::"},
+					},
+				},
+			},
+			fieldSelector: fields.ParseSelectorOrDie("status.podIP=2001:db7::"),
+			expectMatch:   false,
+		},
 	}
 	for _, testCase := range testCases {
 		m := MatchPod(labels.Everything(), testCase.fieldSelector)
@@ -86,6 +189,75 @@ func TestMatchPod(t *testing.T) {
 		}
 		if result != testCase.expectMatch {
 			t.Errorf("Result %v, Expected %v, Selector: %v, Pod: %v", result, testCase.expectMatch, testCase.fieldSelector.String(), testCase.in)
+		}
+	}
+}
+
+func getResourceList(cpu, memory string) api.ResourceList {
+	res := api.ResourceList{}
+	if cpu != "" {
+		res[api.ResourceCPU] = resource.MustParse(cpu)
+	}
+	if memory != "" {
+		res[api.ResourceMemory] = resource.MustParse(memory)
+	}
+	return res
+}
+
+func getResourceRequirements(requests, limits api.ResourceList) api.ResourceRequirements {
+	res := api.ResourceRequirements{}
+	res.Requests = requests
+	res.Limits = limits
+	return res
+}
+
+func newContainer(name string, requests api.ResourceList, limits api.ResourceList) api.Container {
+	return api.Container{
+		Name:      name,
+		Resources: getResourceRequirements(requests, limits),
+	}
+}
+
+func newPod(name string, containers []api.Container) *api.Pod {
+	return &api.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: api.PodSpec{
+			Containers: containers,
+		},
+	}
+}
+
+func TestGetPodQOS(t *testing.T) {
+	testCases := []struct {
+		pod      *api.Pod
+		expected api.PodQOSClass
+	}{
+		{
+			pod: newPod("guaranteed", []api.Container{
+				newContainer("guaranteed", getResourceList("100m", "100Mi"), getResourceList("100m", "100Mi")),
+			}),
+			expected: api.PodQOSGuaranteed,
+		},
+		{
+			pod: newPod("best-effort", []api.Container{
+				newContainer("best-effort", getResourceList("", ""), getResourceList("", "")),
+			}),
+			expected: api.PodQOSBestEffort,
+		},
+		{
+			pod: newPod("burstable", []api.Container{
+				newContainer("burstable", getResourceList("100m", "100Mi"), getResourceList("", "")),
+			}),
+			expected: api.PodQOSBurstable,
+		},
+	}
+	for id, testCase := range testCases {
+		Strategy.PrepareForCreate(genericapirequest.NewContext(), testCase.pod)
+		actual := testCase.pod.Status.QOSClass
+		if actual != testCase.expected {
+			t.Errorf("[%d]: invalid qos pod %s, expected: %s, actual: %s", id, testCase.pod.Name, testCase.expected, actual)
 		}
 	}
 }
@@ -134,8 +306,8 @@ func TestCheckGracefulDelete(t *testing.T) {
 		},
 	}
 	for _, tc := range tcs {
-		out := &api.DeleteOptions{GracePeriodSeconds: &defaultGracePeriod}
-		Strategy.CheckGracefulDelete(api.NewContext(), tc.in, out)
+		out := &metav1.DeleteOptions{GracePeriodSeconds: &defaultGracePeriod}
+		Strategy.CheckGracefulDelete(genericapirequest.NewContext(), tc.in, out)
 		if out.GracePeriodSeconds == nil {
 			t.Errorf("out grace period was nil but supposed to be %v", tc.gracePeriod)
 		}
@@ -149,39 +321,70 @@ type mockPodGetter struct {
 	pod *api.Pod
 }
 
-func (g mockPodGetter) Get(api.Context, string) (runtime.Object, error) {
+func (g mockPodGetter) Get(context.Context, string, *metav1.GetOptions) (runtime.Object, error) {
 	return g.pod, nil
 }
 
 func TestCheckLogLocation(t *testing.T) {
-	ctx := api.NewDefaultContext()
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EphemeralContainers, true)()
+	ctx := genericapirequest.NewDefaultContext()
+	fakePodName := "test"
 	tcs := []struct {
-		in          *api.Pod
-		opts        *api.PodLogOptions
-		expectedErr error
+		name              string
+		in                *api.Pod
+		opts              *api.PodLogOptions
+		expectedErr       error
+		expectedTransport http.RoundTripper
 	}{
 		{
+			name: "simple",
 			in: &api.Pod{
-				Spec:   api.PodSpec{},
-				Status: api.PodStatus{},
-			},
-			opts:        &api.PodLogOptions{},
-			expectedErr: errors.NewBadRequest("a container name must be specified for pod test"),
-		},
-		{
-			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: fakePodName},
 				Spec: api.PodSpec{
 					Containers: []api.Container{
 						{Name: "mycontainer"},
 					},
+					NodeName: "foo",
 				},
 				Status: api.PodStatus{},
 			},
-			opts:        &api.PodLogOptions{},
-			expectedErr: nil,
+			opts:              &api.PodLogOptions{},
+			expectedErr:       nil,
+			expectedTransport: fakeSecureRoundTripper,
 		},
 		{
+			name: "insecure",
 			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: fakePodName},
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{Name: "mycontainer"},
+					},
+					NodeName: "foo",
+				},
+				Status: api.PodStatus{},
+			},
+			opts: &api.PodLogOptions{
+				InsecureSkipTLSVerifyBackend: true,
+			},
+			expectedErr:       nil,
+			expectedTransport: fakeInsecureRoundTripper,
+		},
+		{
+			name: "missing container",
+			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: fakePodName},
+				Spec:       api.PodSpec{},
+				Status:     api.PodStatus{},
+			},
+			opts:              &api.PodLogOptions{},
+			expectedErr:       errors.NewBadRequest("a container name must be specified for pod test"),
+			expectedTransport: nil,
+		},
+		{
+			name: "choice of two containers",
+			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: fakePodName},
 				Spec: api.PodSpec{
 					Containers: []api.Container{
 						{Name: "container1"},
@@ -190,11 +393,14 @@ func TestCheckLogLocation(t *testing.T) {
 				},
 				Status: api.PodStatus{},
 			},
-			opts:        &api.PodLogOptions{},
-			expectedErr: errors.NewBadRequest("a container name must be specified for pod test, choose one of: [container1 container2]"),
+			opts:              &api.PodLogOptions{},
+			expectedErr:       errors.NewBadRequest("a container name must be specified for pod test, choose one of: [container1 container2]"),
+			expectedTransport: nil,
 		},
 		{
+			name: "initcontainers",
 			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: fakePodName},
 				Spec: api.PodSpec{
 					Containers: []api.Container{
 						{Name: "container1"},
@@ -206,11 +412,35 @@ func TestCheckLogLocation(t *testing.T) {
 				},
 				Status: api.PodStatus{},
 			},
-			opts:        &api.PodLogOptions{},
-			expectedErr: errors.NewBadRequest("a container name must be specified for pod test, choose one of: [container1 container2] or one of the init containers: [initcontainer1]"),
+			opts:              &api.PodLogOptions{},
+			expectedErr:       errors.NewBadRequest("a container name must be specified for pod test, choose one of: [initcontainer1 container1 container2]"),
+			expectedTransport: nil,
 		},
 		{
 			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: fakePodName},
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{Name: "container1"},
+						{Name: "container2"},
+					},
+					InitContainers: []api.Container{
+						{Name: "initcontainer1"},
+					},
+					EphemeralContainers: []api.EphemeralContainer{
+						{EphemeralContainerCommon: api.EphemeralContainerCommon{Name: "debugger"}},
+					},
+				},
+				Status: api.PodStatus{},
+			},
+			opts:              &api.PodLogOptions{},
+			expectedErr:       errors.NewBadRequest("a container name must be specified for pod test, choose one of: [initcontainer1 container1 container2 debugger]"),
+			expectedTransport: nil,
+		},
+		{
+			name: "bad container",
+			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: fakePodName},
 				Spec: api.PodSpec{
 					Containers: []api.Container{
 						{Name: "container1"},
@@ -222,38 +452,654 @@ func TestCheckLogLocation(t *testing.T) {
 			opts: &api.PodLogOptions{
 				Container: "unknown",
 			},
-			expectedErr: errors.NewBadRequest("container unknown is not valid for pod test"),
+			expectedErr:       errors.NewBadRequest("container unknown is not valid for pod test"),
+			expectedTransport: nil,
 		},
 		{
+			name: "good with two containers",
 			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: fakePodName},
 				Spec: api.PodSpec{
 					Containers: []api.Container{
 						{Name: "container1"},
 						{Name: "container2"},
 					},
+					NodeName: "foo",
 				},
 				Status: api.PodStatus{},
 			},
 			opts: &api.PodLogOptions{
 				Container: "container2",
 			},
-			expectedErr: nil,
+			expectedErr:       nil,
+			expectedTransport: fakeSecureRoundTripper,
 		},
 	}
 	for _, tc := range tcs {
-		getter := &mockPodGetter{tc.in}
-		_, _, err := LogLocation(getter, nil, ctx, "test", tc.opts)
-		if !reflect.DeepEqual(err, tc.expectedErr) {
-			t.Errorf("expected %v, got %v", tc.expectedErr, err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			getter := &mockPodGetter{tc.in}
+			connectionGetter := &mockConnectionInfoGetter{&client.ConnectionInfo{
+				Transport:                      fakeSecureRoundTripper,
+				InsecureSkipTLSVerifyTransport: fakeInsecureRoundTripper,
+			}}
+
+			_, actualTransport, err := LogLocation(ctx, getter, connectionGetter, fakePodName, tc.opts)
+			if !reflect.DeepEqual(err, tc.expectedErr) {
+				t.Errorf("expected %q, got %q", tc.expectedErr, err)
+			}
+			if actualTransport != tc.expectedTransport {
+				t.Errorf("expected %q, got %q", tc.expectedTransport, actualTransport)
+			}
+		})
 	}
 }
 
 func TestSelectableFieldLabelConversions(t *testing.T) {
 	apitesting.TestSelectableFieldLabelConversionsOfKind(t,
-		testapi.Default.GroupVersion().String(),
+		"v1",
 		"Pod",
-		PodToSelectableFields(&api.Pod{}),
+		ToSelectableFields(&api.Pod{}),
 		nil,
 	)
+}
+
+type mockConnectionInfoGetter struct {
+	info *client.ConnectionInfo
+}
+
+func (g mockConnectionInfoGetter) GetConnectionInfo(ctx context.Context, nodeName types.NodeName) (*client.ConnectionInfo, error) {
+	return g.info, nil
+}
+
+func TestPortForwardLocation(t *testing.T) {
+	ctx := genericapirequest.NewDefaultContext()
+	tcs := []struct {
+		in          *api.Pod
+		info        *client.ConnectionInfo
+		opts        *api.PodPortForwardOptions
+		expectedErr error
+		expectedURL *url.URL
+	}{
+		{
+			in: &api.Pod{
+				Spec: api.PodSpec{},
+			},
+			opts:        &api.PodPortForwardOptions{},
+			expectedErr: errors.NewBadRequest("pod test does not have a host assigned"),
+		},
+		{
+			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ns",
+					Name:      "pod1",
+				},
+				Spec: api.PodSpec{
+					NodeName: "node1",
+				},
+			},
+			info:        &client.ConnectionInfo{},
+			opts:        &api.PodPortForwardOptions{},
+			expectedURL: &url.URL{Host: ":", Path: "/portForward/ns/pod1"},
+		},
+		{
+			in: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ns",
+					Name:      "pod1",
+				},
+				Spec: api.PodSpec{
+					NodeName: "node1",
+				},
+			},
+			info:        &client.ConnectionInfo{},
+			opts:        &api.PodPortForwardOptions{Ports: []int32{80}},
+			expectedURL: &url.URL{Host: ":", Path: "/portForward/ns/pod1", RawQuery: "port=80"},
+		},
+	}
+	for _, tc := range tcs {
+		getter := &mockPodGetter{tc.in}
+		connectionGetter := &mockConnectionInfoGetter{tc.info}
+		loc, _, err := PortForwardLocation(ctx, getter, connectionGetter, "test", tc.opts)
+		if !reflect.DeepEqual(err, tc.expectedErr) {
+			t.Errorf("expected %v, got %v", tc.expectedErr, err)
+		}
+		if !reflect.DeepEqual(loc, tc.expectedURL) {
+			t.Errorf("expected %v, got %v", tc.expectedURL, loc)
+		}
+	}
+}
+
+func TestGetPodIP(t *testing.T) {
+	testCases := []struct {
+		name       string
+		pod        *api.Pod
+		expectedIP string
+	}{
+		{
+			name:       "nil pod",
+			pod:        nil,
+			expectedIP: "",
+		},
+		{
+			name: "no status object",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod1"},
+				Spec:       api.PodSpec{},
+			},
+			expectedIP: "",
+		},
+		{
+			name: "no pod ips",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod1"},
+				Spec:       api.PodSpec{},
+				Status:     api.PodStatus{},
+			},
+			expectedIP: "",
+		},
+		{
+			name: "empty list",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod1"},
+				Spec:       api.PodSpec{},
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{},
+				},
+			},
+			expectedIP: "",
+		},
+		{
+			name: "1 ip",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod1"},
+				Spec:       api.PodSpec{},
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "10.0.0.10"},
+					},
+				},
+			},
+			expectedIP: "10.0.0.10",
+		},
+		{
+			name: "multiple ips",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod1"},
+				Spec:       api.PodSpec{},
+				Status: api.PodStatus{
+					PodIPs: []api.PodIP{
+						{IP: "10.0.0.10"},
+						{IP: "10.0.0.20"},
+					},
+				},
+			},
+			expectedIP: "10.0.0.10",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			podIP := getPodIP(tc.pod)
+			if podIP != tc.expectedIP {
+				t.Errorf("expected pod ip:%v does not match actual %v", tc.expectedIP, podIP)
+			}
+		})
+	}
+}
+
+type fakeTransport struct {
+	val string
+}
+
+func (f fakeTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+var (
+	fakeSecureRoundTripper   = fakeTransport{val: "secure"}
+	fakeInsecureRoundTripper = fakeTransport{val: "insecure"}
+)
+
+func TestPodIndexFunc(t *testing.T) {
+	tcs := []struct {
+		name          string
+		indexFunc     cache.IndexFunc
+		pod           interface{}
+		expectedValue string
+		expectedErr   error
+	}{
+		{
+			name:      "node name index",
+			indexFunc: NodeNameIndexFunc,
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					NodeName: "test-pod",
+				},
+			},
+			expectedValue: "test-pod",
+			expectedErr:   nil,
+		},
+		{
+			name:          "not a pod failed",
+			indexFunc:     NodeNameIndexFunc,
+			pod:           "not a pod object",
+			expectedValue: "test-pod",
+			expectedErr:   fmt.Errorf("not a pod"),
+		},
+	}
+
+	for _, tc := range tcs {
+		indexValues, err := tc.indexFunc(tc.pod)
+		if !reflect.DeepEqual(err, tc.expectedErr) {
+			t.Errorf("name %v, expected %v, got %v", tc.name, tc.expectedErr, err)
+		}
+		if err == nil && len(indexValues) != 1 && indexValues[0] != tc.expectedValue {
+			t.Errorf("name %v, expected %v, got %v", tc.name, tc.expectedValue, indexValues)
+		}
+
+	}
+}
+func TestApplySeccompVersionSkew(t *testing.T) {
+	const containerName = "container"
+	testProfile := "test"
+
+	for _, test := range []struct {
+		description string
+		pod         *api.Pod
+		validation  func(*testing.T, *api.Pod)
+	}{
+		{
+			description: "Security context nil",
+			pod:         &api.Pod{},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.NotNil(t, pod)
+			},
+		},
+		{
+			description: "Security context not nil",
+			pod: &api.Pod{
+				Spec: api.PodSpec{SecurityContext: &api.PodSecurityContext{}},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.NotNil(t, pod)
+			},
+		},
+		{
+			description: "Field type unconfined and no annotation present",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					SecurityContext: &api.PodSecurityContext{
+						SeccompProfile: &api.SeccompProfile{
+							Type: api.SeccompProfileTypeUnconfined,
+						},
+					},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Len(t, pod.Annotations, 1)
+				require.Equal(t, v1.SeccompProfileNameUnconfined, pod.Annotations[api.SeccompPodAnnotationKey])
+			},
+		},
+		{
+			description: "Field type default and no annotation present",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					SecurityContext: &api.PodSecurityContext{
+						SeccompProfile: &api.SeccompProfile{
+							Type: api.SeccompProfileTypeRuntimeDefault,
+						},
+					},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Len(t, pod.Annotations, 1)
+				require.Equal(t, v1.SeccompProfileRuntimeDefault, pod.Annotations[v1.SeccompPodAnnotationKey])
+			},
+		},
+		{
+			description: "Field type localhost and no annotation present",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					SecurityContext: &api.PodSecurityContext{
+						SeccompProfile: &api.SeccompProfile{
+							Type:             api.SeccompProfileTypeLocalhost,
+							LocalhostProfile: &testProfile,
+						},
+					},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Len(t, pod.Annotations, 1)
+				require.Equal(t, "localhost/test", pod.Annotations[v1.SeccompPodAnnotationKey])
+			},
+		},
+		{
+			description: "Field type localhost but profile is nil",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					SecurityContext: &api.PodSecurityContext{
+						SeccompProfile: &api.SeccompProfile{
+							Type: api.SeccompProfileTypeLocalhost,
+						},
+					},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Len(t, pod.Annotations, 0)
+			},
+		},
+		{
+			description: "Annotation 'unconfined' and no field present",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.SeccompPodAnnotationKey: v1.SeccompProfileNameUnconfined,
+					},
+				},
+				Spec: api.PodSpec{},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Equal(t, api.SeccompProfileTypeUnconfined, pod.Spec.SecurityContext.SeccompProfile.Type)
+				require.Nil(t, pod.Spec.SecurityContext.SeccompProfile.LocalhostProfile)
+			},
+		},
+		{
+			description: "Annotation 'runtime/default' and no field present",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.SeccompPodAnnotationKey: v1.SeccompProfileRuntimeDefault,
+					},
+				},
+				Spec: api.PodSpec{SecurityContext: &api.PodSecurityContext{}},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Equal(t, api.SeccompProfileTypeRuntimeDefault, pod.Spec.SecurityContext.SeccompProfile.Type)
+				require.Nil(t, pod.Spec.SecurityContext.SeccompProfile.LocalhostProfile)
+			},
+		},
+		{
+			description: "Annotation 'docker/default' and no field present",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.SeccompPodAnnotationKey: v1.DeprecatedSeccompProfileDockerDefault,
+					},
+				},
+				Spec: api.PodSpec{SecurityContext: &api.PodSecurityContext{}},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Equal(t, api.SeccompProfileTypeRuntimeDefault, pod.Spec.SecurityContext.SeccompProfile.Type)
+				require.Nil(t, pod.Spec.SecurityContext.SeccompProfile.LocalhostProfile)
+			},
+		},
+		{
+			description: "Annotation 'localhost/test' and no field present",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.SeccompPodAnnotationKey: v1.SeccompLocalhostProfileNamePrefix + testProfile,
+					},
+				},
+				Spec: api.PodSpec{SecurityContext: &api.PodSecurityContext{}},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Equal(t, api.SeccompProfileTypeLocalhost, pod.Spec.SecurityContext.SeccompProfile.Type)
+				require.Equal(t, testProfile, *pod.Spec.SecurityContext.SeccompProfile.LocalhostProfile)
+			},
+		},
+		{
+			description: "Annotation 'localhost/' has zero length",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.SeccompPodAnnotationKey: v1.SeccompLocalhostProfileNamePrefix,
+					},
+				},
+				Spec: api.PodSpec{SecurityContext: &api.PodSecurityContext{}},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Nil(t, pod.Spec.SecurityContext.SeccompProfile)
+			},
+		},
+		{
+			description: "Security context nil (container)",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					Containers: []api.Container{{}},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.NotNil(t, pod)
+			},
+		},
+		{
+			description: "Security context not nil (container)",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					Containers: []api.Container{{
+						SecurityContext: &api.SecurityContext{},
+					}},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.NotNil(t, pod)
+			},
+		},
+		{
+			description: "Field type unconfined and no annotation present (container)",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{
+							Name: containerName,
+							SecurityContext: &api.SecurityContext{
+								SeccompProfile: &api.SeccompProfile{
+									Type: api.SeccompProfileTypeUnconfined,
+								},
+							},
+						},
+					},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Len(t, pod.Annotations, 1)
+				require.Equal(t, v1.SeccompProfileNameUnconfined, pod.Annotations[v1.SeccompContainerAnnotationKeyPrefix+containerName])
+			},
+		},
+		{
+			description: "Field type runtime/default and no annotation present (container)",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{
+							Name: containerName,
+							SecurityContext: &api.SecurityContext{
+								SeccompProfile: &api.SeccompProfile{
+									Type: api.SeccompProfileTypeRuntimeDefault,
+								},
+							},
+						},
+					},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Len(t, pod.Annotations, 1)
+				require.Equal(t, v1.SeccompProfileRuntimeDefault, pod.Annotations[v1.SeccompContainerAnnotationKeyPrefix+containerName])
+			},
+		},
+		{
+			description: "Field type localhost and no annotation present (container)",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{
+							Name: containerName,
+							SecurityContext: &api.SecurityContext{
+								SeccompProfile: &api.SeccompProfile{
+									Type:             api.SeccompProfileTypeLocalhost,
+									LocalhostProfile: &testProfile,
+								},
+							},
+						},
+					},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Len(t, pod.Annotations, 1)
+				require.Equal(t, "localhost/test", pod.Annotations[v1.SeccompContainerAnnotationKeyPrefix+containerName])
+			},
+		},
+		{
+			description: "Multiple containers with fields (container)",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{
+							Name: containerName + "1",
+							SecurityContext: &api.SecurityContext{
+								SeccompProfile: &api.SeccompProfile{
+									Type: api.SeccompProfileTypeUnconfined,
+								},
+							},
+						},
+						{
+							Name: containerName + "2",
+						},
+						{
+							Name: containerName + "3",
+							SecurityContext: &api.SecurityContext{
+								SeccompProfile: &api.SeccompProfile{
+									Type: api.SeccompProfileTypeRuntimeDefault,
+								},
+							},
+						},
+					},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Len(t, pod.Annotations, 2)
+				require.Equal(t, v1.SeccompProfileNameUnconfined, pod.Annotations[v1.SeccompContainerAnnotationKeyPrefix+containerName+"1"])
+				require.Equal(t, v1.SeccompProfileRuntimeDefault, pod.Annotations[v1.SeccompContainerAnnotationKeyPrefix+containerName+"3"])
+			},
+		},
+		{
+			description: "Annotation 'unconfined' and no field present (container)",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.SeccompContainerAnnotationKeyPrefix + containerName: v1.SeccompProfileNameUnconfined,
+					},
+				},
+				Spec: api.PodSpec{
+					Containers: []api.Container{{
+						Name: containerName,
+					}},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Equal(t, api.SeccompProfileTypeUnconfined, pod.Spec.Containers[0].SecurityContext.SeccompProfile.Type)
+				require.Nil(t, pod.Spec.Containers[0].SecurityContext.SeccompProfile.LocalhostProfile)
+			},
+		},
+		{
+			description: "Annotation 'runtime/default' and no field present (container)",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.SeccompContainerAnnotationKeyPrefix + containerName: v1.SeccompProfileRuntimeDefault,
+					},
+				},
+				Spec: api.PodSpec{
+					Containers: []api.Container{{
+						Name:            containerName,
+						SecurityContext: &api.SecurityContext{},
+					}},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Equal(t, api.SeccompProfileTypeRuntimeDefault, pod.Spec.Containers[0].SecurityContext.SeccompProfile.Type)
+				require.Nil(t, pod.Spec.Containers[0].SecurityContext.SeccompProfile.LocalhostProfile)
+			},
+		},
+		{
+			description: "Annotation 'docker/default' and no field present (container)",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.SeccompContainerAnnotationKeyPrefix + containerName: v1.DeprecatedSeccompProfileDockerDefault,
+					},
+				},
+				Spec: api.PodSpec{
+					Containers: []api.Container{{
+						Name:            containerName,
+						SecurityContext: &api.SecurityContext{},
+					}},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Equal(t, api.SeccompProfileTypeRuntimeDefault, pod.Spec.Containers[0].SecurityContext.SeccompProfile.Type)
+				require.Nil(t, pod.Spec.Containers[0].SecurityContext.SeccompProfile.LocalhostProfile)
+			},
+		},
+		{
+			description: "Multiple containers by annotations (container)",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.SeccompContainerAnnotationKeyPrefix + containerName + "1": v1.SeccompLocalhostProfileNamePrefix + testProfile,
+						v1.SeccompContainerAnnotationKeyPrefix + containerName + "3": v1.SeccompProfileRuntimeDefault,
+					},
+				},
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{Name: containerName + "1"},
+						{Name: containerName + "2"},
+						{Name: containerName + "3"},
+					},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Equal(t, api.SeccompProfileTypeLocalhost, pod.Spec.Containers[0].SecurityContext.SeccompProfile.Type)
+				require.Equal(t, testProfile, *pod.Spec.Containers[0].SecurityContext.SeccompProfile.LocalhostProfile)
+				require.Equal(t, api.SeccompProfileTypeRuntimeDefault, pod.Spec.Containers[2].SecurityContext.SeccompProfile.Type)
+			},
+		},
+		{
+			description: "Annotation 'localhost/test' and no field present (container)",
+			pod: &api.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.SeccompContainerAnnotationKeyPrefix + containerName: v1.SeccompLocalhostProfileNamePrefix + testProfile,
+					},
+				},
+				Spec: api.PodSpec{
+					Containers: []api.Container{{
+						Name:            containerName,
+						SecurityContext: &api.SecurityContext{},
+					}},
+				},
+			},
+			validation: func(t *testing.T, pod *api.Pod) {
+				require.Equal(t, api.SeccompProfileTypeLocalhost, pod.Spec.Containers[0].SecurityContext.SeccompProfile.Type)
+				require.Equal(t, testProfile, *pod.Spec.Containers[0].SecurityContext.SeccompProfile.LocalhostProfile)
+			},
+		},
+	} {
+		output := &api.Pod{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+		}
+		for i, ctr := range test.pod.Spec.Containers {
+			output.Spec.Containers = append(output.Spec.Containers, api.Container{})
+			if ctr.SecurityContext != nil && ctr.SecurityContext.SeccompProfile != nil {
+				output.Spec.Containers[i].SecurityContext = &api.SecurityContext{
+					SeccompProfile: &api.SeccompProfile{
+						Type:             api.SeccompProfileType(ctr.SecurityContext.SeccompProfile.Type),
+						LocalhostProfile: ctr.SecurityContext.SeccompProfile.LocalhostProfile,
+					},
+				}
+			}
+		}
+		applySeccompVersionSkew(test.pod)
+		test.validation(t, test.pod)
+	}
 }

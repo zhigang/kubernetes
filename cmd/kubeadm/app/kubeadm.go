@@ -17,58 +17,35 @@ limitations under the License.
 package app
 
 import (
-	"fmt"
+	"flag"
 	"os"
-	"runtime"
-	"strings"
 
-	"github.com/renstrom/dedent"
 	"github.com/spf13/pflag"
 
+	"k8s.io/klog/v2"
+
+	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/util/logs"
 )
 
-var AlphaWarningOnExit = dedent.Dedent(`
-	kubeadm: I am an alpha version, my authors welcome your feedback and bug reports
-	kubeadm: please create issue an using https://github.com/kubernetes/kubernetes/issues/new
-	kubeadm: and make sure to mention @kubernetes/sig-cluster-lifecycle. Thank you!
-`)
-
-// TODO(phase2) use componentconfig
-// we need some params for testing etc, let's keep these hidden for now
-func getEnvParams() map[string]string {
-
-	envParams := map[string]string{
-		// TODO(phase1+): Mode prefix and host_pki_path to another place as constants, and use them everywhere
-		// Right now they're used here and there, but not consequently
-		"kubernetes_dir":     "/etc/kubernetes",
-		"host_pki_path":      "/etc/kubernetes/pki",
-		"host_etcd_path":     "/var/lib/etcd",
-		"hyperkube_image":    "",
-		"discovery_image":    fmt.Sprintf("gcr.io/google_containers/kube-discovery-%s:%s", runtime.GOARCH, "1.0"),
-		"etcd_image":         "",
-		"component_loglevel": "--v=4",
-	}
-
-	for k := range envParams {
-		if v := os.Getenv(fmt.Sprintf("KUBE_%s", strings.ToUpper(k))); v != "" {
-			envParams[k] = v
-		}
-	}
-
-	return envParams
-}
-
+// Run creates and executes new kubeadm command
 func Run() error {
-	logs.InitLogs()
-	defer logs.FlushLogs()
+	klog.InitFlags(nil)
+	pflag.CommandLine.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
+	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 
+	pflag.Set("logtostderr", "true")
 	// We do not want these flags to show up in --help
-	pflag.CommandLine.MarkHidden("google-json-key")
+	// These MarkHidden calls must be after the lines above
+	pflag.CommandLine.MarkHidden("version")
 	pflag.CommandLine.MarkHidden("log-flush-frequency")
+	pflag.CommandLine.MarkHidden("alsologtostderr")
+	pflag.CommandLine.MarkHidden("log-backtrace-at")
+	pflag.CommandLine.MarkHidden("log-dir")
+	pflag.CommandLine.MarkHidden("logtostderr")
+	pflag.CommandLine.MarkHidden("stderrthreshold")
+	pflag.CommandLine.MarkHidden("vmodule")
 
-	cmd := cmd.NewKubeadmCommand(cmdutil.NewFactory(nil), os.Stdin, os.Stdout, os.Stderr, getEnvParams())
+	cmd := cmd.NewKubeadmCommand(os.Stdin, os.Stdout, os.Stderr)
 	return cmd.Execute()
 }

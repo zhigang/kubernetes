@@ -20,12 +20,15 @@ import (
 	"net/http"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // TODO: Reconcile custom types in kubelet/types and this subpackage
 
-type HttpGetter interface {
+// HTTPGetter is an interface representing the ability to perform HTTP GET requests.
+type HTTPGetter interface {
+	// Get issues a GET to the specified URL.
 	Get(url string) (*http.Response, error)
 }
 
@@ -40,10 +43,10 @@ func NewTimestamp() *Timestamp {
 	return &Timestamp{time.Now()}
 }
 
-// ConvertToTimestamp takes a string, parses it using the RFC3339Nano layout,
+// ConvertToTimestamp takes a string, parses it using the RFC3339NanoLenient layout,
 // and converts it to a Timestamp object.
 func ConvertToTimestamp(timeString string) *Timestamp {
-	parsed, _ := time.Parse(time.RFC3339Nano, timeString)
+	parsed, _ := time.Parse(RFC3339NanoLenient, timeString)
 	return &Timestamp{parsed}
 }
 
@@ -52,14 +55,14 @@ func (t *Timestamp) Get() time.Time {
 	return t.time
 }
 
-// GetString returns the time in the string format using the RFC3339Nano
+// GetString returns the time in the string format using the RFC3339NanoFixed
 // layout.
 func (t *Timestamp) GetString() string {
-	return t.time.Format(time.RFC3339Nano)
+	return t.time.Format(RFC3339NanoFixed)
 }
 
 // A type to help sort container statuses based on container names.
-type SortedContainerStatuses []api.ContainerStatus
+type SortedContainerStatuses []v1.ContainerStatus
 
 func (s SortedContainerStatuses) Len() int      { return len(s) }
 func (s SortedContainerStatuses) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
@@ -70,7 +73,7 @@ func (s SortedContainerStatuses) Less(i, j int) bool {
 
 // SortInitContainerStatuses ensures that statuses are in the order that their
 // init container appears in the pod spec
-func SortInitContainerStatuses(p *api.Pod, statuses []api.ContainerStatus) {
+func SortInitContainerStatuses(p *v1.Pod, statuses []v1.ContainerStatus) {
 	containers := p.Spec.InitContainers
 	current := 0
 	for _, container := range containers {
@@ -84,10 +87,27 @@ func SortInitContainerStatuses(p *api.Pod, statuses []api.ContainerStatus) {
 	}
 }
 
+func SortStatusesOfInitContainers(p *v1.Pod, statusMap map[string]*v1.ContainerStatus) []v1.ContainerStatus {
+	containers := p.Spec.InitContainers
+	statuses := []v1.ContainerStatus{}
+	for _, container := range containers {
+		if status, found := statusMap[container.Name]; found {
+			statuses = append(statuses, *status)
+		}
+	}
+	return statuses
+}
+
 // Reservation represents reserved resources for non-pod components.
 type Reservation struct {
 	// System represents resources reserved for non-kubernetes components.
-	System api.ResourceList
+	System v1.ResourceList
 	// Kubernetes represents resources reserved for kubernetes system components.
-	Kubernetes api.ResourceList
+	Kubernetes v1.ResourceList
 }
+
+// A pod UID which has been translated/resolved to the representation known to kubelets.
+type ResolvedPodUID types.UID
+
+// A pod UID for a mirror pod.
+type MirrorPodUID types.UID

@@ -20,60 +20,72 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/util/intstr"
 )
 
 func TestContainerLabels(t *testing.T) {
 	deletionGracePeriod := int64(10)
 	terminationGracePeriod := int64(10)
-	lifecycle := &api.Lifecycle{
+	lifecycle := &v1.Lifecycle{
 		// Left PostStart as nil
-		PreStop: &api.Handler{
-			Exec: &api.ExecAction{
+		PreStop: &v1.Handler{
+			Exec: &v1.ExecAction{
 				Command: []string{"action1", "action2"},
 			},
-			HTTPGet: &api.HTTPGetAction{
+			HTTPGet: &v1.HTTPGetAction{
 				Path:   "path",
 				Host:   "host",
 				Port:   intstr.FromInt(8080),
 				Scheme: "scheme",
 			},
-			TCPSocket: &api.TCPSocketAction{
+			TCPSocket: &v1.TCPSocketAction{
 				Port: intstr.FromString("80"),
 			},
 		},
 	}
-	container := &api.Container{
-		Name: "test_container",
+	container := &v1.Container{
+		Name:                   "test_container",
 		TerminationMessagePath: "/somepath",
 		Lifecycle:              lifecycle,
 	}
-	pod := &api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name:      "test_pod",
-			Namespace: "test_pod_namespace",
-			UID:       "test_pod_uid",
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:                       "test_pod",
+			Namespace:                  "test_pod_namespace",
+			UID:                        "test_pod_uid",
 			DeletionGracePeriodSeconds: &deletionGracePeriod,
 		},
-		Spec: api.PodSpec{
-			Containers:                    []api.Container{*container},
+		Spec: v1.PodSpec{
+			Containers:                    []v1.Container{*container},
 			TerminationGracePeriodSeconds: &terminationGracePeriod,
 		},
 	}
-	expected := &labeledContainerInfo{
-		PodName:       pod.Name,
-		PodNamespace:  pod.Namespace,
-		PodUID:        pod.UID,
-		ContainerName: container.Name,
+
+	var tests = []struct {
+		description string
+		expected    *labeledContainerInfo
+	}{
+		{
+			"Regular containers",
+			&labeledContainerInfo{
+				PodName:       pod.Name,
+				PodNamespace:  pod.Namespace,
+				PodUID:        pod.UID,
+				ContainerName: container.Name,
+			},
+		},
 	}
 
 	// Test whether we can get right information from label
-	labels := newContainerLabels(container, pod)
-	containerInfo := getContainerInfoFromLabels(labels)
-	if !reflect.DeepEqual(containerInfo, expected) {
-		t.Errorf("expected %v, got %v", expected, containerInfo)
+	for _, test := range tests {
+		labels := newContainerLabels(container, pod)
+		containerInfo := getContainerInfoFromLabels(labels)
+		if !reflect.DeepEqual(containerInfo, test.expected) {
+			t.Errorf("%v: expected %v, got %v", test.description, test.expected, containerInfo)
+		}
 	}
 }
 
@@ -81,52 +93,57 @@ func TestContainerAnnotations(t *testing.T) {
 	restartCount := 5
 	deletionGracePeriod := int64(10)
 	terminationGracePeriod := int64(10)
-	lifecycle := &api.Lifecycle{
+	opts := &kubecontainer.RunContainerOptions{
+		Annotations: []kubecontainer.Annotation{
+			{Name: "Foo", Value: "bar"},
+		},
+	}
+	lifecycle := &v1.Lifecycle{
 		// Left PostStart as nil
-		PreStop: &api.Handler{
-			Exec: &api.ExecAction{
+		PreStop: &v1.Handler{
+			Exec: &v1.ExecAction{
 				Command: []string{"action1", "action2"},
 			},
-			HTTPGet: &api.HTTPGetAction{
+			HTTPGet: &v1.HTTPGetAction{
 				Path:   "path",
 				Host:   "host",
 				Port:   intstr.FromInt(8080),
 				Scheme: "scheme",
 			},
-			TCPSocket: &api.TCPSocketAction{
+			TCPSocket: &v1.TCPSocketAction{
 				Port: intstr.FromString("80"),
 			},
 		},
 	}
-	containerPorts := []api.ContainerPort{
+	containerPorts := []v1.ContainerPort{
 		{
 			Name:          "http",
 			HostPort:      80,
 			ContainerPort: 8080,
-			Protocol:      api.ProtocolTCP,
+			Protocol:      v1.ProtocolTCP,
 		},
 		{
 			Name:          "https",
 			HostPort:      443,
 			ContainerPort: 6443,
-			Protocol:      api.ProtocolTCP,
+			Protocol:      v1.ProtocolTCP,
 		},
 	}
-	container := &api.Container{
-		Name:  "test_container",
-		Ports: containerPorts,
+	container := &v1.Container{
+		Name:                   "test_container",
+		Ports:                  containerPorts,
 		TerminationMessagePath: "/somepath",
 		Lifecycle:              lifecycle,
 	}
-	pod := &api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name:      "test_pod",
-			Namespace: "test_pod_namespace",
-			UID:       "test_pod_uid",
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:                       "test_pod",
+			Namespace:                  "test_pod_namespace",
+			UID:                        "test_pod_uid",
 			DeletionGracePeriodSeconds: &deletionGracePeriod,
 		},
-		Spec: api.PodSpec{
-			Containers:                    []api.Container{*container},
+		Spec: v1.PodSpec{
+			Containers:                    []v1.Container{*container},
 			TerminationGracePeriodSeconds: &terminationGracePeriod,
 		},
 	}
@@ -134,17 +151,20 @@ func TestContainerAnnotations(t *testing.T) {
 		ContainerPorts:            containerPorts,
 		PodDeletionGracePeriod:    pod.DeletionGracePeriodSeconds,
 		PodTerminationGracePeriod: pod.Spec.TerminationGracePeriodSeconds,
-		Hash:                   kubecontainer.HashContainer(container),
-		RestartCount:           restartCount,
-		TerminationMessagePath: container.TerminationMessagePath,
-		PreStopHandler:         container.Lifecycle.PreStop,
+		Hash:                      kubecontainer.HashContainer(container),
+		RestartCount:              restartCount,
+		TerminationMessagePath:    container.TerminationMessagePath,
+		PreStopHandler:            container.Lifecycle.PreStop,
 	}
 
 	// Test whether we can get right information from label
-	annotations := newContainerAnnotations(container, pod, restartCount)
+	annotations := newContainerAnnotations(container, pod, restartCount, opts)
 	containerInfo := getContainerInfoFromAnnotations(annotations)
 	if !reflect.DeepEqual(containerInfo, expected) {
 		t.Errorf("expected %v, got %v", expected, containerInfo)
+	}
+	if v, ok := annotations[opts.Annotations[0].Name]; !ok || v != opts.Annotations[0].Value {
+		t.Errorf("expected annotation %s to exist got %v, %v", opts.Annotations[0].Name, ok, v)
 	}
 
 	// Test when DeletionGracePeriodSeconds, TerminationGracePeriodSeconds and Lifecycle are nil,
@@ -157,23 +177,26 @@ func TestContainerAnnotations(t *testing.T) {
 	expected.PreStopHandler = nil
 	// Because container is changed, the Hash should be updated
 	expected.Hash = kubecontainer.HashContainer(container)
-	annotations = newContainerAnnotations(container, pod, restartCount)
+	annotations = newContainerAnnotations(container, pod, restartCount, opts)
 	containerInfo = getContainerInfoFromAnnotations(annotations)
 	if !reflect.DeepEqual(containerInfo, expected) {
 		t.Errorf("expected %v, got %v", expected, containerInfo)
 	}
+	if v, ok := annotations[opts.Annotations[0].Name]; !ok || v != opts.Annotations[0].Value {
+		t.Errorf("expected annotation %s to exist got %v, %v", opts.Annotations[0].Name, ok, v)
+	}
 }
 
 func TestPodLabels(t *testing.T) {
-	pod := &api.Pod{
-		ObjectMeta: api.ObjectMeta{
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test_pod",
 			Namespace: "test_pod_namespace",
 			UID:       "test_pod_uid",
 			Labels:    map[string]string{"foo": "bar"},
 		},
-		Spec: api.PodSpec{
-			Containers: []api.Container{},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{},
 		},
 	}
 	expected := &labeledPodSandboxInfo{
@@ -192,15 +215,15 @@ func TestPodLabels(t *testing.T) {
 }
 
 func TestPodAnnotations(t *testing.T) {
-	pod := &api.Pod{
-		ObjectMeta: api.ObjectMeta{
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:        "test_pod",
 			Namespace:   "test_pod_namespace",
 			UID:         "test_pod_uid",
 			Annotations: map[string]string{"foo": "bar"},
 		},
-		Spec: api.PodSpec{
-			Containers: []api.Container{},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{},
 		},
 	}
 	expected := &annotatedPodSandboxInfo{

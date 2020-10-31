@@ -17,29 +17,31 @@ limitations under the License.
 package exists
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
-	"k8s.io/kubernetes/pkg/admission"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
-	"k8s.io/kubernetes/pkg/client/testing/core"
-	"k8s.io/kubernetes/pkg/controller/informers"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/wait"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/admission"
+	genericadmissioninitializer "k8s.io/apiserver/pkg/admission/initializer"
+	informers "k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	core "k8s.io/client-go/testing"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
 // newHandlerForTest returns the admission controller configured for testing.
-func newHandlerForTest(c clientset.Interface) (admission.Interface, informers.SharedInformerFactory, error) {
+func newHandlerForTest(c kubernetes.Interface) (admission.ValidationInterface, informers.SharedInformerFactory, error) {
 	f := informers.NewSharedInformerFactory(c, 5*time.Minute)
-	handler := NewExists(c)
-	plugins := []admission.Interface{handler}
-	pluginInitializer := admission.NewPluginInitializer(f)
-	pluginInitializer.Initialize(plugins)
-	err := admission.Validate(plugins)
+	handler := NewExists()
+	pluginInitializer := genericadmissioninitializer.New(c, f, nil, nil)
+	pluginInitializer.Initialize(handler)
+	err := admission.ValidateInitialization(handler)
 	return handler, f, err
 }
 
@@ -47,14 +49,14 @@ func newHandlerForTest(c clientset.Interface) (admission.Interface, informers.Sh
 func newMockClientForTest(namespaces []string) *fake.Clientset {
 	mockClient := &fake.Clientset{}
 	mockClient.AddReactor("list", "namespaces", func(action core.Action) (bool, runtime.Object, error) {
-		namespaceList := &api.NamespaceList{
-			ListMeta: unversioned.ListMeta{
+		namespaceList := &corev1.NamespaceList{
+			ListMeta: metav1.ListMeta{
 				ResourceVersion: fmt.Sprintf("%d", len(namespaces)),
 			},
 		}
 		for i, ns := range namespaces {
-			namespaceList.Items = append(namespaceList.Items, api.Namespace{
-				ObjectMeta: api.ObjectMeta{
+			namespaceList.Items = append(namespaceList.Items, corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:            ns,
 					ResourceVersion: fmt.Sprintf("%d", i),
 				},
@@ -68,7 +70,7 @@ func newMockClientForTest(namespaces []string) *fake.Clientset {
 // newPod returns a new pod for the specified namespace
 func newPod(namespace string) api.Pod {
 	return api.Pod{
-		ObjectMeta: api.ObjectMeta{Name: "123", Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: namespace},
 		Spec: api.PodSpec{
 			Volumes:    []api.Volume{{Name: "vol"}},
 			Containers: []api.Container{{Name: "ctr", Image: "image"}},
@@ -87,7 +89,7 @@ func TestAdmissionNamespaceExists(t *testing.T) {
 	informerFactory.Start(wait.NeverStop)
 
 	pod := newPod(namespace)
-	err = handler.Admit(admission.NewAttributesRecord(&pod, nil, api.Kind("Pod").WithVersion("version"), pod.Namespace, pod.Name, api.Resource("pods").WithVersion("version"), "", admission.Create, nil))
+	err = handler.Validate(context.TODO(), admission.NewAttributesRecord(&pod, nil, api.Kind("Pod").WithVersion("version"), pod.Namespace, pod.Name, api.Resource("pods").WithVersion("version"), "", admission.Create, &metav1.CreateOptions{}, false, nil), nil)
 	if err != nil {
 		t.Errorf("unexpected error returned from admission handler")
 	}
@@ -107,7 +109,7 @@ func TestAdmissionNamespaceDoesNotExist(t *testing.T) {
 	informerFactory.Start(wait.NeverStop)
 
 	pod := newPod(namespace)
-	err = handler.Admit(admission.NewAttributesRecord(&pod, nil, api.Kind("Pod").WithVersion("version"), pod.Namespace, pod.Name, api.Resource("pods").WithVersion("version"), "", admission.Create, nil))
+	err = handler.Validate(context.TODO(), admission.NewAttributesRecord(&pod, nil, api.Kind("Pod").WithVersion("version"), pod.Namespace, pod.Name, api.Resource("pods").WithVersion("version"), "", admission.Create, &metav1.CreateOptions{}, false, nil), nil)
 	if err == nil {
 		actions := ""
 		for _, action := range mockClient.Actions() {

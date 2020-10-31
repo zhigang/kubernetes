@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -21,11 +21,13 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 
-# Then build a release
-"${KUBE_ROOT}/build/release.sh"
-if [ "$?" != "0" ]; then
+# Build a dev release
+
+
+if ! make -f "${KUBE_ROOT}"/Makefile quick-release
+then
         echo "Building the release failed!"
         exit 1
 fi

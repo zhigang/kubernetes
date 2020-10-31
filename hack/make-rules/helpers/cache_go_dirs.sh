@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -28,7 +28,7 @@ if [[ -z "${1:-}" ]]; then
 fi
 CACHE="$1"; shift
 
-trap "rm -f '${CACHE}'" HUP INT TERM ERR
+trap 'rm -f "${CACHE}"' HUP INT TERM ERR
 
 # This is a partial 'find' command.  The caller is expected to pass the
 # remaining arguments.
@@ -36,18 +36,22 @@ trap "rm -f '${CACHE}'" HUP INT TERM ERR
 # Example:
 #   kfind -type f -name foobar.go
 function kfind() {
-    find .                         \
+    # We want to include the "special" vendor directories which are actually
+    # part of the Kubernetes source tree (./staging/*) but we need them to be
+    # named as their ./vendor/* equivalents.  Also, we  do not want all of
+    # ./vendor or even all of ./vendor/k8s.io.
+    find -H .                      \
+        \(                         \
         -not \(                    \
             \(                     \
-                -path ./vendor -o  \
-                -path ./staging -o \
                 -path ./_\* -o     \
                 -path ./.\* -o     \
-                -path ./docs -o    \
-                -path ./examples   \
+                -path ./vendor     \
             \) -prune              \
         \)                         \
-        "$@"
+        \)                         \
+        "$@"                       \
+        | sed 's|^./staging/src|vendor|'
 }
 
 NEED_FIND=true
@@ -57,12 +61,12 @@ if [[ -f "${CACHE}" ]]; then
     N=$(kfind -type d -newer "${CACHE}" -print -quit | wc -l)
     [[ "${N}" == 0 ]] && NEED_FIND=false
 fi
-mkdir -p $(dirname "${CACHE}")
-if $("${NEED_FIND}"); then
+mkdir -p "$(dirname "${CACHE}")"
+if ${NEED_FIND}; then
     kfind -type f -name \*.go  \
-        | xargs -n1 dirname    \
-        | sort -u              \
+        | sed 's|/[^/]*$||'    \
         | sed 's|^./||'        \
+        | LC_ALL=C sort -u     \
         > "${CACHE}"
 fi
 cat "${CACHE}"

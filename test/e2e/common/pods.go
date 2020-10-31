@@ -18,45 +18,57 @@ package common
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/net/websocket"
 
-	"k8s.io/kubernetes/pkg/api"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/tools/cache"
+	watchtools "k8s.io/client-go/tools/watch"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/kubelet"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/util/intstr"
-	"k8s.io/kubernetes/pkg/util/uuid"
-	"k8s.io/kubernetes/pkg/util/wait"
-	"k8s.io/kubernetes/pkg/watch"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2ewebsocket "k8s.io/kubernetes/test/e2e/framework/websocket"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo"
+	"github.com/onsi/gomega"
 )
 
-var (
+const (
 	buildBackOffDuration = time.Minute
 	syncLoopFrequency    = 10 * time.Second
 	maxBackOffTolerance  = time.Duration(1.3 * float64(kubelet.MaxContainerBackOff))
+	podRetryPeriod       = 1 * time.Second
+	podRetryTimeout      = 1 * time.Minute
 )
 
 // testHostIP tests that a pod gets a host IP
-func testHostIP(podClient *framework.PodClient, pod *api.Pod) {
-	By("creating pod")
-	defer podClient.Delete(pod.Name, api.NewDeleteOptions(0))
+func testHostIP(podClient *framework.PodClient, pod *v1.Pod) {
+	ginkgo.By("creating pod")
 	podClient.CreateSync(pod)
 
 	// Try to make sure we get a hostIP for each pod.
 	hostIPTimeout := 2 * time.Minute
 	t := time.Now()
 	for {
-		p, err := podClient.Get(pod.Name)
-		Expect(err).NotTo(HaveOccurred())
+		p, err := podClient.Get(context.TODO(), pod.Name, metav1.GetOptions{})
+		framework.ExpectNoError(err, "Failed to get pod %q", pod.Name)
 		if p.Status.HostIP != "" {
 			framework.Logf("Pod %s has hostIP: %s", p.Name, p.Status.HostIP)
 			break
@@ -70,26 +82,26 @@ func testHostIP(podClient *framework.PodClient, pod *api.Pod) {
 	}
 }
 
-func startPodAndGetBackOffs(podClient *framework.PodClient, pod *api.Pod, sleepAmount time.Duration) (time.Duration, time.Duration) {
+func startPodAndGetBackOffs(podClient *framework.PodClient, pod *v1.Pod, sleepAmount time.Duration) (time.Duration, time.Duration) {
 	podClient.CreateSync(pod)
 	time.Sleep(sleepAmount)
-	Expect(pod.Spec.Containers).NotTo(BeEmpty())
+	gomega.Expect(pod.Spec.Containers).NotTo(gomega.BeEmpty())
 	podName := pod.Name
 	containerName := pod.Spec.Containers[0].Name
 
-	By("getting restart delay-0")
+	ginkgo.By("getting restart delay-0")
 	_, err := getRestartDelay(podClient, podName, containerName)
 	if err != nil {
 		framework.Failf("timed out waiting for container restart in pod=%s/%s", podName, containerName)
 	}
 
-	By("getting restart delay-1")
+	ginkgo.By("getting restart delay-1")
 	delay1, err := getRestartDelay(podClient, podName, containerName)
 	if err != nil {
 		framework.Failf("timed out waiting for container restart in pod=%s/%s", podName, containerName)
 	}
 
-	By("getting restart delay-2")
+	ginkgo.By("getting restart delay-2")
 	delay2, err := getRestartDelay(podClient, podName, containerName)
 	if err != nil {
 		framework.Failf("timed out waiting for container restart in pod=%s/%s", podName, containerName)
@@ -99,290 +111,354 @@ func startPodAndGetBackOffs(podClient *framework.PodClient, pod *api.Pod, sleepA
 
 func getRestartDelay(podClient *framework.PodClient, podName string, containerName string) (time.Duration, error) {
 	beginTime := time.Now()
+	var previousRestartCount int32 = -1
+	var previousFinishedAt time.Time
 	for time.Since(beginTime) < (2 * maxBackOffTolerance) { // may just miss the 1st MaxContainerBackOff delay
 		time.Sleep(time.Second)
-		pod, err := podClient.Get(podName)
+		pod, err := podClient.Get(context.TODO(), podName, metav1.GetOptions{})
 		framework.ExpectNoError(err, fmt.Sprintf("getting pod %s", podName))
-		status, ok := api.GetContainerStatus(pod.Status.ContainerStatuses, containerName)
+		status, ok := podutil.GetContainerStatus(pod.Status.ContainerStatuses, containerName)
 		if !ok {
 			framework.Logf("getRestartDelay: status missing")
 			continue
 		}
 
-		if status.State.Waiting == nil && status.State.Running != nil && status.LastTerminationState.Terminated != nil && status.State.Running.StartedAt.Time.After(beginTime) {
-			startedAt := status.State.Running.StartedAt.Time
-			finishedAt := status.LastTerminationState.Terminated.FinishedAt.Time
-			framework.Logf("getRestartDelay: restartCount = %d, finishedAt=%s restartedAt=%s (%s)", status.RestartCount, finishedAt, startedAt, startedAt.Sub(finishedAt))
-			return startedAt.Sub(finishedAt), nil
+		// the only case this happens is if this is the first time the Pod is running and there is no "Last State".
+		if status.LastTerminationState.Terminated == nil {
+			framework.Logf("Container's last state is not \"Terminated\".")
+			continue
+		}
+
+		if previousRestartCount == -1 {
+			if status.State.Running != nil {
+				// container is still Running, there is no "FinishedAt" time.
+				continue
+			} else if status.State.Terminated != nil {
+				previousFinishedAt = status.State.Terminated.FinishedAt.Time
+			} else {
+				previousFinishedAt = status.LastTerminationState.Terminated.FinishedAt.Time
+			}
+			previousRestartCount = status.RestartCount
+		}
+
+		// when the RestartCount is changed, the Containers will be in one of the following states:
+		//Running, Terminated, Waiting (it already is waiting for the backoff period to expire, and the last state details have been stored into status.LastTerminationState).
+		if status.RestartCount > previousRestartCount {
+			var startedAt time.Time
+			if status.State.Running != nil {
+				startedAt = status.State.Running.StartedAt.Time
+			} else if status.State.Terminated != nil {
+				startedAt = status.State.Terminated.StartedAt.Time
+			} else {
+				startedAt = status.LastTerminationState.Terminated.StartedAt.Time
+			}
+			framework.Logf("getRestartDelay: restartCount = %d, finishedAt=%s restartedAt=%s (%s)", status.RestartCount, previousFinishedAt, startedAt, startedAt.Sub(previousFinishedAt))
+			return startedAt.Sub(previousFinishedAt), nil
 		}
 	}
 	return 0, fmt.Errorf("timeout getting pod restart delay")
 }
 
+// expectNoErrorWithRetries checks if an error occurs with the given retry count.
+func expectNoErrorWithRetries(fn func() error, maxRetries int, explain ...interface{}) {
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		err = fn()
+		if err == nil {
+			return
+		}
+		framework.Logf("(Attempt %d of %d) Unexpected error occurred: %v", i+1, maxRetries, err)
+	}
+	if err != nil {
+		debug.PrintStack()
+	}
+	gomega.ExpectWithOffset(1, err).NotTo(gomega.HaveOccurred(), explain...)
+}
+
 var _ = framework.KubeDescribe("Pods", func() {
 	f := framework.NewDefaultFramework("pods")
 	var podClient *framework.PodClient
-	BeforeEach(func() {
+	ginkgo.BeforeEach(func() {
 		podClient = f.PodClient()
 	})
 
-	It("should get a host IP [Conformance]", func() {
+	/*
+		Release: v1.9
+		Testname: Pods, assigned hostip
+		Description: Create a Pod. Pod status MUST return successfully and contains a valid IP address.
+	*/
+	framework.ConformanceIt("should get a host IP [NodeConformance]", func() {
 		name := "pod-hostip-" + string(uuid.NewUUID())
-		testHostIP(podClient, &api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		testHostIP(podClient, &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{
 						Name:  "test",
-						Image: framework.GetPauseImageName(f.Client),
+						Image: imageutils.GetPauseImageName(),
 					},
 				},
 			},
 		})
 	})
 
-	It("should be submitted and removed [Conformance]", func() {
-		By("creating the pod")
+	/*
+		Release: v1.9
+		Testname: Pods, lifecycle
+		Description: A Pod is created with a unique label. Pod MUST be accessible when queried using the label selector upon creation. Add a watch, check if the Pod is running. Pod then deleted, The pod deletion timestamp is observed. The watch MUST return the pod deleted event. Query with the original selector for the Pod MUST return empty list.
+	*/
+	framework.ConformanceIt("should be submitted and removed [NodeConformance]", func() {
+		ginkgo.By("creating the pod")
 		name := "pod-submit-remove-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
-		pod := &api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 				Labels: map[string]string{
 					"name": "foo",
 					"time": value,
 				},
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{
 						Name:  "nginx",
-						Image: "gcr.io/google_containers/nginx-slim:0.7",
+						Image: imageutils.GetE2EImage(imageutils.Nginx),
 					},
 				},
 			},
 		}
 
-		By("setting up watch")
+		ginkgo.By("setting up watch")
 		selector := labels.SelectorFromSet(labels.Set(map[string]string{"time": value}))
-		options := api.ListOptions{LabelSelector: selector}
-		pods, err := podClient.List(options)
-		Expect(err).NotTo(HaveOccurred(), "failed to query for pods")
-		Expect(len(pods.Items)).To(Equal(0))
-		options = api.ListOptions{
-			LabelSelector:   selector,
+		options := metav1.ListOptions{LabelSelector: selector.String()}
+		pods, err := podClient.List(context.TODO(), options)
+		framework.ExpectNoError(err, "failed to query for pods")
+		framework.ExpectEqual(len(pods.Items), 0)
+		options = metav1.ListOptions{
+			LabelSelector:   selector.String(),
 			ResourceVersion: pods.ListMeta.ResourceVersion,
 		}
-		w, err := podClient.Watch(options)
-		Expect(err).NotTo(HaveOccurred(), "failed to set up watch")
 
-		By("submitting the pod to kubernetes")
-		// We call defer here in case there is a problem with
-		// the test so we can ensure that we clean up after
-		// ourselves
-		defer podClient.Delete(pod.Name, api.NewDeleteOptions(0))
+		listCompleted := make(chan bool, 1)
+		lw := &cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				options.LabelSelector = selector.String()
+				podList, err := podClient.List(context.TODO(), options)
+				if err == nil {
+					select {
+					case listCompleted <- true:
+						framework.Logf("observed the pod list")
+						return podList, err
+					default:
+						framework.Logf("channel blocked")
+					}
+				}
+				return podList, err
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				options.LabelSelector = selector.String()
+				return podClient.Watch(context.TODO(), options)
+			},
+		}
+		_, _, w, _ := watchtools.NewIndexerInformerWatcher(lw, &v1.Pod{})
+		defer w.Stop()
+
+		ginkgo.By("submitting the pod to kubernetes")
 		podClient.Create(pod)
 
-		By("verifying the pod is in kubernetes")
+		ginkgo.By("verifying the pod is in kubernetes")
 		selector = labels.SelectorFromSet(labels.Set(map[string]string{"time": value}))
-		options = api.ListOptions{LabelSelector: selector}
-		pods, err = podClient.List(options)
-		Expect(err).NotTo(HaveOccurred(), "failed to query for pods")
-		Expect(len(pods.Items)).To(Equal(1))
+		options = metav1.ListOptions{LabelSelector: selector.String()}
+		pods, err = podClient.List(context.TODO(), options)
+		framework.ExpectNoError(err, "failed to query for pods")
+		framework.ExpectEqual(len(pods.Items), 1)
 
-		By("verifying pod creation was observed")
+		ginkgo.By("verifying pod creation was observed")
 		select {
-		case event, _ := <-w.ResultChan():
-			if event.Type != watch.Added {
-				framework.Failf("Failed to observe pod creation: %v", event)
+		case <-listCompleted:
+			select {
+			case event := <-w.ResultChan():
+				if event.Type != watch.Added {
+					framework.Failf("Failed to observe pod creation: %v", event)
+				}
+			case <-time.After(framework.PodStartTimeout):
+				framework.Failf("Timeout while waiting for pod creation")
 			}
-		case <-time.After(framework.PodStartTimeout):
-			Fail("Timeout while waiting for pod creation")
+		case <-time.After(10 * time.Second):
+			framework.Failf("Timeout while waiting to observe pod list")
 		}
 
 		// We need to wait for the pod to be running, otherwise the deletion
 		// may be carried out immediately rather than gracefully.
-		framework.ExpectNoError(f.WaitForPodRunning(pod.Name))
+		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(f.ClientSet, pod.Name, f.Namespace.Name))
 		// save the running pod
-		pod, err = podClient.Get(pod.Name)
-		Expect(err).NotTo(HaveOccurred(), "failed to GET scheduled pod")
-		framework.Logf("running pod: %#v", pod)
+		pod, err = podClient.Get(context.TODO(), pod.Name, metav1.GetOptions{})
+		framework.ExpectNoError(err, "failed to GET scheduled pod")
 
-		By("deleting the pod gracefully")
-		err = podClient.Delete(pod.Name, api.NewDeleteOptions(30))
-		Expect(err).NotTo(HaveOccurred(), "failed to delete pod")
+		ginkgo.By("deleting the pod gracefully")
+		err = podClient.Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(30))
+		framework.ExpectNoError(err, "failed to delete pod")
 
-		By("verifying the kubelet observed the termination notice")
-		Expect(wait.Poll(time.Second*5, time.Second*30, func() (bool, error) {
-			podList, err := framework.GetKubeletPods(f.Client, pod.Spec.NodeName)
-			if err != nil {
-				framework.Logf("Unable to retrieve kubelet pods for node %v: %v", pod.Spec.NodeName, err)
-				return false, nil
-			}
-			for _, kubeletPod := range podList.Items {
-				if pod.Name != kubeletPod.Name {
-					continue
-				}
-				if kubeletPod.ObjectMeta.DeletionTimestamp == nil {
-					framework.Logf("deletion has not yet been observed")
-					return false, nil
-				}
-				return true, nil
-			}
-			framework.Logf("no pod exists with the name we were looking for, assuming the termination request was observed and completed")
-			return true, nil
-		})).NotTo(HaveOccurred(), "kubelet never observed the termination notice")
-
-		By("verifying pod deletion was observed")
+		ginkgo.By("verifying pod deletion was observed")
 		deleted := false
-		timeout := false
-		var lastPod *api.Pod
-		timer := time.After(30 * time.Second)
-		for !deleted && !timeout {
+		var lastPod *v1.Pod
+		timer := time.After(framework.DefaultPodDeletionTimeout)
+		for !deleted {
 			select {
-			case event, _ := <-w.ResultChan():
-				if event.Type == watch.Deleted {
-					lastPod = event.Object.(*api.Pod)
+			case event := <-w.ResultChan():
+				switch event.Type {
+				case watch.Deleted:
+					lastPod = event.Object.(*v1.Pod)
 					deleted = true
+				case watch.Error:
+					framework.Logf("received a watch error: %v", event.Object)
+					framework.Failf("watch closed with error")
 				}
 			case <-timer:
-				timeout = true
+				framework.Failf("timed out waiting for pod deletion")
 			}
 		}
 		if !deleted {
-			Fail("Failed to observe pod deletion")
+			framework.Failf("Failed to observe pod deletion")
 		}
 
-		Expect(lastPod.DeletionTimestamp).ToNot(BeNil())
-		Expect(lastPod.Spec.TerminationGracePeriodSeconds).ToNot(BeZero())
+		gomega.Expect(lastPod.DeletionTimestamp).ToNot(gomega.BeNil())
+		gomega.Expect(lastPod.Spec.TerminationGracePeriodSeconds).ToNot(gomega.BeZero())
 
 		selector = labels.SelectorFromSet(labels.Set(map[string]string{"time": value}))
-		options = api.ListOptions{LabelSelector: selector}
-		pods, err = podClient.List(options)
-		Expect(err).NotTo(HaveOccurred(), "failed to query for pods")
-		Expect(len(pods.Items)).To(Equal(0))
+		options = metav1.ListOptions{LabelSelector: selector.String()}
+		pods, err = podClient.List(context.TODO(), options)
+		framework.ExpectNoError(err, "failed to query for pods")
+		framework.ExpectEqual(len(pods.Items), 0)
 	})
 
-	It("should be updated [Conformance]", func() {
-		By("creating the pod")
+	/*
+		Release: v1.9
+		Testname: Pods, update
+		Description: Create a Pod with a unique label. Query for the Pod with the label as selector MUST be successful. Update the pod to change the value of the Label. Query for the Pod with the new value for the label MUST be successful.
+	*/
+	framework.ConformanceIt("should be updated [NodeConformance]", func() {
+		ginkgo.By("creating the pod")
 		name := "pod-update-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
-		pod := &api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 				Labels: map[string]string{
 					"name": "foo",
 					"time": value,
 				},
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{
 						Name:  "nginx",
-						Image: "gcr.io/google_containers/nginx-slim:0.7",
+						Image: imageutils.GetE2EImage(imageutils.Nginx),
 					},
 				},
 			},
 		}
 
-		By("submitting the pod to kubernetes")
-		defer func() {
-			By("deleting the pod")
-			podClient.Delete(pod.Name, api.NewDeleteOptions(0))
-		}()
+		ginkgo.By("submitting the pod to kubernetes")
 		pod = podClient.CreateSync(pod)
 
-		By("verifying the pod is in kubernetes")
+		ginkgo.By("verifying the pod is in kubernetes")
 		selector := labels.SelectorFromSet(labels.Set(map[string]string{"time": value}))
-		options := api.ListOptions{LabelSelector: selector}
-		pods, err := podClient.List(options)
-		Expect(err).NotTo(HaveOccurred(), "failed to query for pods")
-		Expect(len(pods.Items)).To(Equal(1))
+		options := metav1.ListOptions{LabelSelector: selector.String()}
+		pods, err := podClient.List(context.TODO(), options)
+		framework.ExpectNoError(err, "failed to query for pods")
+		framework.ExpectEqual(len(pods.Items), 1)
 
-		By("updating the pod")
-		podClient.Update(name, func(pod *api.Pod) {
+		ginkgo.By("updating the pod")
+		podClient.Update(name, func(pod *v1.Pod) {
 			value = strconv.Itoa(time.Now().Nanosecond())
 			pod.Labels["time"] = value
 		})
 
-		framework.ExpectNoError(f.WaitForPodRunning(pod.Name))
+		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(f.ClientSet, pod.Name, f.Namespace.Name))
 
-		By("verifying the updated pod is in kubernetes")
+		ginkgo.By("verifying the updated pod is in kubernetes")
 		selector = labels.SelectorFromSet(labels.Set(map[string]string{"time": value}))
-		options = api.ListOptions{LabelSelector: selector}
-		pods, err = podClient.List(options)
-		Expect(err).NotTo(HaveOccurred(), "failed to query for pods")
-		Expect(len(pods.Items)).To(Equal(1))
+		options = metav1.ListOptions{LabelSelector: selector.String()}
+		pods, err = podClient.List(context.TODO(), options)
+		framework.ExpectNoError(err, "failed to query for pods")
+		framework.ExpectEqual(len(pods.Items), 1)
 		framework.Logf("Pod update OK")
 	})
 
-	It("should allow activeDeadlineSeconds to be updated [Conformance]", func() {
-		By("creating the pod")
+	/*
+		Release: v1.9
+		Testname: Pods, ActiveDeadlineSeconds
+		Description: Create a Pod with a unique label. Query for the Pod with the label as selector MUST be successful. The Pod is updated with ActiveDeadlineSeconds set on the Pod spec. Pod MUST terminate of the specified time elapses.
+	*/
+	framework.ConformanceIt("should allow activeDeadlineSeconds to be updated [NodeConformance]", func() {
+		ginkgo.By("creating the pod")
 		name := "pod-update-activedeadlineseconds-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
-		pod := &api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 				Labels: map[string]string{
 					"name": "foo",
 					"time": value,
 				},
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{
 						Name:  "nginx",
-						Image: "gcr.io/google_containers/nginx-slim:0.7",
+						Image: imageutils.GetE2EImage(imageutils.Nginx),
 					},
 				},
 			},
 		}
 
-		By("submitting the pod to kubernetes")
-		defer func() {
-			By("deleting the pod")
-			podClient.Delete(pod.Name, api.NewDeleteOptions(0))
-		}()
+		ginkgo.By("submitting the pod to kubernetes")
 		podClient.CreateSync(pod)
 
-		By("verifying the pod is in kubernetes")
+		ginkgo.By("verifying the pod is in kubernetes")
 		selector := labels.SelectorFromSet(labels.Set(map[string]string{"time": value}))
-		options := api.ListOptions{LabelSelector: selector}
-		pods, err := podClient.List(options)
-		Expect(err).NotTo(HaveOccurred(), "failed to query for pods")
-		Expect(len(pods.Items)).To(Equal(1))
+		options := metav1.ListOptions{LabelSelector: selector.String()}
+		pods, err := podClient.List(context.TODO(), options)
+		framework.ExpectNoError(err, "failed to query for pods")
+		framework.ExpectEqual(len(pods.Items), 1)
 
-		By("updating the pod")
-		podClient.Update(name, func(pod *api.Pod) {
+		ginkgo.By("updating the pod")
+		podClient.Update(name, func(pod *v1.Pod) {
 			newDeadline := int64(5)
 			pod.Spec.ActiveDeadlineSeconds = &newDeadline
 		})
 
-		framework.ExpectNoError(f.WaitForPodTerminated(pod.Name, "DeadlineExceeded"))
+		framework.ExpectNoError(e2epod.WaitForPodTerminatedInNamespace(f.ClientSet, pod.Name, "DeadlineExceeded", f.Namespace.Name))
 	})
 
-	It("should contain environment variables for services [Conformance]", func() {
+	/*
+		Release: v1.9
+		Testname: Pods, service environment variables
+		Description: Create a server Pod listening on port 9376. A Service called fooservice is created for the server Pod listening on port 8765 targeting port 8080. If a new Pod is created in the cluster then the Pod MUST have the fooservice environment variables available from this new Pod. The new create Pod MUST have environment variables such as FOOSERVICE_SERVICE_HOST, FOOSERVICE_SERVICE_PORT, FOOSERVICE_PORT, FOOSERVICE_PORT_8765_TCP_PORT, FOOSERVICE_PORT_8765_TCP_PROTO, FOOSERVICE_PORT_8765_TCP and FOOSERVICE_PORT_8765_TCP_ADDR that are populated with proper values.
+	*/
+	framework.ConformanceIt("should contain environment variables for services [NodeConformance]", func() {
 		// Make a pod that will be a service.
 		// This pod serves its hostname via HTTP.
 		serverName := "server-envvars-" + string(uuid.NewUUID())
-		serverPod := &api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		serverPod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name:   serverName,
 				Labels: map[string]string{"name": serverName},
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{
 						Name:  "srv",
-						Image: "gcr.io/google_containers/serve_hostname:v1.4",
-						Ports: []api.ContainerPort{{ContainerPort: 9376}},
+						Image: framework.ServeHostnameImage,
+						Ports: []v1.ContainerPort{{ContainerPort: 9376}},
 					},
 				},
 			},
 		}
-		defer podClient.Delete(serverPod.Name, api.NewDeleteOptions(0))
 		podClient.CreateSync(serverPod)
 
 		// This service exposes port 8080 of the test pod as a service on port 8765
@@ -393,15 +469,15 @@ var _ = framework.KubeDescribe("Pods", func() {
 		// to match the service.  Another is to rethink environment variable names and possibly
 		// allow overriding the prefix in the service manifest.
 		svcName := "fooservice"
-		svc := &api.Service{
-			ObjectMeta: api.ObjectMeta{
+		svc := &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: svcName,
 				Labels: map[string]string{
 					"name": svcName,
 				},
 			},
-			Spec: api.ServiceSpec{
-				Ports: []api.ServicePort{{
+			Spec: v1.ServiceSpec{
+				Ports: []v1.ServicePort{{
 					Port:       8765,
 					TargetPort: intstr.FromInt(8080),
 				}},
@@ -410,27 +486,26 @@ var _ = framework.KubeDescribe("Pods", func() {
 				},
 			},
 		}
-		defer f.Client.Services(f.Namespace.Name).Delete(svc.Name)
-		_, err := f.Client.Services(f.Namespace.Name).Create(svc)
-		Expect(err).NotTo(HaveOccurred(), "failed to create service")
+		_, err := f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(context.TODO(), svc, metav1.CreateOptions{})
+		framework.ExpectNoError(err, "failed to create service")
 
 		// Make a client pod that verifies that it has the service environment variables.
 		podName := "client-envvars-" + string(uuid.NewUUID())
 		const containerName = "env3cont"
-		pod := &api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name:   podName,
 				Labels: map[string]string{"name": podName},
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{
 						Name:    containerName,
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"sh", "-c", "env"},
 					},
 				},
-				RestartPolicy: api.RestartPolicyNever,
+				RestartPolicy: v1.RestartPolicyNever,
 			},
 		}
 
@@ -446,40 +521,42 @@ var _ = framework.KubeDescribe("Pods", func() {
 			"FOOSERVICE_PORT_8765_TCP=",
 			"FOOSERVICE_PORT_8765_TCP_ADDR=",
 		}
-		framework.ExpectNoErrorWithRetries(func() error {
-			return f.MatchContainerOutput(pod, containerName, expectedVars, ContainSubstring)
+		expectNoErrorWithRetries(func() error {
+			return f.MatchContainerOutput(pod, containerName, expectedVars, gomega.ContainSubstring)
 		}, maxRetries, "Container should have service environment variables set")
 	})
 
-	It("should support remote command execution over websockets", func() {
+	/*
+		Release: v1.13
+		Testname: Pods, remote command execution over websocket
+		Description: A Pod is created. Websocket is created to retrieve exec command output from this pod.
+		Message retrieved form Websocket MUST match with expected exec command output.
+	*/
+	framework.ConformanceIt("should support remote command execution over websockets [NodeConformance]", func() {
 		config, err := framework.LoadConfig()
-		Expect(err).NotTo(HaveOccurred(), "unable to get base config")
+		framework.ExpectNoError(err, "unable to get base config")
 
-		By("creating the pod")
+		ginkgo.By("creating the pod")
 		name := "pod-exec-websocket-" + string(uuid.NewUUID())
-		pod := &api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{
 						Name:    "main",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/sh", "-c", "echo container is alive; sleep 600"},
 					},
 				},
 			},
 		}
 
-		By("submitting the pod to kubernetes")
-		defer func() {
-			By("deleting the pod")
-			podClient.Delete(pod.Name, api.NewDeleteOptions(0))
-		}()
+		ginkgo.By("submitting the pod to kubernetes")
 		pod = podClient.CreateSync(pod)
 
-		req := f.Client.Get().
+		req := f.ClientSet.CoreV1().RESTClient().Get().
 			Namespace(f.Namespace.Name).
 			Resource("pods").
 			Name(pod.Name).
@@ -487,18 +564,18 @@ var _ = framework.KubeDescribe("Pods", func() {
 			Param("stderr", "1").
 			Param("stdout", "1").
 			Param("container", pod.Spec.Containers[0].Name).
-			Param("command", "cat").
-			Param("command", "/etc/resolv.conf")
+			Param("command", "echo").
+			Param("command", "remote execution test")
 
 		url := req.URL()
-		ws, err := framework.OpenWebSocketForURL(url, config, []string{"channel.k8s.io"})
+		ws, err := e2ewebsocket.OpenWebSocketForURL(url, config, []string{"channel.k8s.io"})
 		if err != nil {
 			framework.Failf("Failed to open websocket to %s: %v", url.String(), err)
 		}
 		defer ws.Close()
 
 		buf := &bytes.Buffer{}
-		Eventually(func() error {
+		gomega.Eventually(func() error {
 			for {
 				var msg []byte
 				if err := websocket.Message.Receive(ws, &msg); err != nil {
@@ -511,45 +588,57 @@ var _ = framework.KubeDescribe("Pods", func() {
 					continue
 				}
 				if msg[0] != 1 {
-					framework.Failf("Got message from server that didn't start with channel 1 (STDOUT): %v", msg)
+					if len(msg) == 1 {
+						// skip an empty message on stream other than stdout
+						continue
+					} else {
+						framework.Failf("Got message from server that didn't start with channel 1 (STDOUT): %v", msg)
+					}
+
 				}
 				buf.Write(msg[1:])
 			}
 			if buf.Len() == 0 {
-				return fmt.Errorf("Unexpected output from server")
+				return fmt.Errorf("unexpected output from server")
 			}
-			if !strings.Contains(buf.String(), "nameserver") {
-				return fmt.Errorf("Expected to find 'nameserver' in %q", buf.String())
+			if !strings.Contains(buf.String(), "remote execution test") {
+				return fmt.Errorf("expected to find 'remote execution test' in %q", buf.String())
 			}
 			return nil
-		}, time.Minute, 10*time.Second).Should(BeNil())
+		}, time.Minute, 10*time.Second).Should(gomega.BeNil())
 	})
 
-	It("should support retrieving logs from the container over websockets", func() {
+	/*
+		Release: v1.13
+		Testname: Pods, logs from websockets
+		Description: A Pod is created. Websocket is created to retrieve log of a container from this pod.
+		Message retrieved form Websocket MUST match with container's output.
+	*/
+	framework.ConformanceIt("should support retrieving logs from the container over websockets [NodeConformance]", func() {
 		config, err := framework.LoadConfig()
-		Expect(err).NotTo(HaveOccurred(), "unable to get base config")
+		framework.ExpectNoError(err, "unable to get base config")
 
-		By("creating the pod")
+		ginkgo.By("creating the pod")
 		name := "pod-logs-websocket-" + string(uuid.NewUUID())
-		pod := &api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{
 						Name:    "main",
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/sh", "-c", "echo container is alive; sleep 10000"},
 					},
 				},
 			},
 		}
 
-		By("submitting the pod to kubernetes")
+		ginkgo.By("submitting the pod to kubernetes")
 		podClient.CreateSync(pod)
 
-		req := f.Client.Get().
+		req := f.ClientSet.CoreV1().RESTClient().Get().
 			Namespace(f.Namespace.Name).
 			Resource("pods").
 			Name(pod.Name).
@@ -558,7 +647,7 @@ var _ = framework.KubeDescribe("Pods", func() {
 
 		url := req.URL()
 
-		ws, err := framework.OpenWebSocketForURL(url, config, []string{"binary.k8s.io"})
+		ws, err := e2ewebsocket.OpenWebSocketForURL(url, config, []string{"binary.k8s.io"})
 		if err != nil {
 			framework.Failf("Failed to open websocket to %s: %v", url.String(), err)
 		}
@@ -582,41 +671,37 @@ var _ = framework.KubeDescribe("Pods", func() {
 		}
 	})
 
-	It("should have their auto-restart back-off timer reset on image update [Slow]", func() {
+	// Slow (~7 mins)
+	ginkgo.It("should have their auto-restart back-off timer reset on image update [Slow][NodeConformance]", func() {
 		podName := "pod-back-off-image"
 		containerName := "back-off"
-		pod := &api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name:   podName,
 				Labels: map[string]string{"test": "back-off-image"},
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{
 						Name:    containerName,
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/sh", "-c", "sleep 5", "/crash/missing"},
 					},
 				},
 			},
 		}
 
-		defer func() {
-			By("deleting the pod")
-			podClient.Delete(pod.Name, api.NewDeleteOptions(0))
-		}()
-
 		delay1, delay2 := startPodAndGetBackOffs(podClient, pod, buildBackOffDuration)
 
-		By("updating the image")
-		podClient.Update(podName, func(pod *api.Pod) {
-			pod.Spec.Containers[0].Image = "gcr.io/google_containers/nginx-slim:0.7"
+		ginkgo.By("updating the image")
+		podClient.Update(podName, func(pod *v1.Pod) {
+			pod.Spec.Containers[0].Image = imageutils.GetE2EImage(imageutils.Nginx)
 		})
 
 		time.Sleep(syncLoopFrequency)
-		framework.ExpectNoError(f.WaitForPodRunning(pod.Name))
+		framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(f.ClientSet, pod.Name, f.Namespace.Name))
 
-		By("get restart delay after image update")
+		ginkgo.By("get restart delay after image update")
 		delayAfterUpdate, err := getRestartDelay(podClient, podName, containerName)
 		if err != nil {
 			framework.Failf("timed out waiting for container restart in pod=%s/%s", podName, containerName)
@@ -627,36 +712,31 @@ var _ = framework.KubeDescribe("Pods", func() {
 		}
 	})
 
-	// Slow issue #19027 (20 mins)
-	It("should cap back-off at MaxContainerBackOff [Slow]", func() {
+	// Slow by design (~27 mins) issue #19027
+	ginkgo.It("should cap back-off at MaxContainerBackOff [Slow][NodeConformance]", func() {
 		podName := "back-off-cap"
 		containerName := "back-off-cap"
-		pod := &api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name:   podName,
 				Labels: map[string]string{"test": "liveness"},
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{
 						Name:    containerName,
-						Image:   "gcr.io/google_containers/busybox:1.24",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 						Command: []string{"/bin/sh", "-c", "sleep 5", "/crash/missing"},
 					},
 				},
 			},
 		}
 
-		defer func() {
-			By("deleting the pod")
-			podClient.Delete(pod.Name, api.NewDeleteOptions(0))
-		}()
-
 		podClient.CreateSync(pod)
 		time.Sleep(2 * kubelet.MaxContainerBackOff) // it takes slightly more than 2*x to get to a back-off of x
 
 		// wait for a delay == capped delay of MaxContainerBackOff
-		By("geting restart delay when capped")
+		ginkgo.By("getting restart delay when capped")
 		var (
 			delay1 time.Duration
 			err    error
@@ -676,7 +756,7 @@ var _ = framework.KubeDescribe("Pods", func() {
 			framework.Failf("expected %s back-off got=%s in delay1", kubelet.MaxContainerBackOff, delay1)
 		}
 
-		By("getting restart delay after a capped delay")
+		ginkgo.By("getting restart delay after a capped delay")
 		delay2, err := getRestartDelay(podClient, podName, containerName)
 		if err != nil {
 			framework.Failf("timed out waiting for container restart in pod=%s/%s", podName, containerName)
@@ -686,4 +766,133 @@ var _ = framework.KubeDescribe("Pods", func() {
 			framework.Failf("expected %s back-off got=%s on delay2", kubelet.MaxContainerBackOff, delay2)
 		}
 	})
+
+	// TODO(freehan): label the test to be [NodeConformance] after tests are proven to be stable.
+	ginkgo.It("should support pod readiness gates [NodeFeature:PodReadinessGate]", func() {
+		podName := "pod-ready"
+		readinessGate1 := "k8s.io/test-condition1"
+		readinessGate2 := "k8s.io/test-condition2"
+		patchStatusFmt := `{"status":{"conditions":[{"type":%q, "status":%q}]}}`
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   podName,
+				Labels: map[string]string{"test": "pod-readiness-gate"},
+			},
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
+					{
+						Name:    "pod-readiness-gate",
+						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
+						Command: []string{"/bin/sh", "-c", "echo container is alive; sleep 10000"},
+					},
+				},
+				ReadinessGates: []v1.PodReadinessGate{
+					{ConditionType: v1.PodConditionType(readinessGate1)},
+					{ConditionType: v1.PodConditionType(readinessGate2)},
+				},
+			},
+		}
+
+		validatePodReadiness := func(expectReady bool) {
+			err := wait.Poll(time.Second, wait.ForeverTestTimeout, func() (bool, error) {
+				podReady := podClient.PodIsReady(podName)
+				res := expectReady == podReady
+				if !res {
+					framework.Logf("Expect the Ready condition of pod %q to be %v, but got %v", podName, expectReady, podReady)
+				}
+				return res, nil
+			})
+			framework.ExpectNoError(err)
+		}
+
+		ginkgo.By("submitting the pod to kubernetes")
+		podClient.CreateSync(pod)
+		framework.ExpectEqual(podClient.PodIsReady(podName), false, "Expect pod's Ready condition to be false initially.")
+
+		ginkgo.By(fmt.Sprintf("patching pod status with condition %q to true", readinessGate1))
+		_, err := podClient.Patch(context.TODO(), podName, types.StrategicMergePatchType, []byte(fmt.Sprintf(patchStatusFmt, readinessGate1, "True")), metav1.PatchOptions{}, "status")
+		framework.ExpectNoError(err)
+		// Sleep for 10 seconds.
+		time.Sleep(syncLoopFrequency)
+		// Verify the pod is still not ready
+		framework.ExpectEqual(podClient.PodIsReady(podName), false, "Expect pod's Ready condition to be false with only one condition in readinessGates equal to True")
+
+		ginkgo.By(fmt.Sprintf("patching pod status with condition %q to true", readinessGate2))
+		_, err = podClient.Patch(context.TODO(), podName, types.StrategicMergePatchType, []byte(fmt.Sprintf(patchStatusFmt, readinessGate2, "True")), metav1.PatchOptions{}, "status")
+		framework.ExpectNoError(err)
+		validatePodReadiness(true)
+
+		ginkgo.By(fmt.Sprintf("patching pod status with condition %q to false", readinessGate1))
+		_, err = podClient.Patch(context.TODO(), podName, types.StrategicMergePatchType, []byte(fmt.Sprintf(patchStatusFmt, readinessGate1, "False")), metav1.PatchOptions{}, "status")
+		framework.ExpectNoError(err)
+		validatePodReadiness(false)
+
+	})
+
+	/*
+		Release: v1.19
+		Testname: Pods, delete a collection
+		Description: A set of pods is created with a label selector which MUST be found when listed.
+		The set of pods is deleted and MUST NOT show up when listed by its label selector.
+	*/
+	framework.ConformanceIt("should delete a collection of pods", func() {
+		podTestNames := []string{"test-pod-1", "test-pod-2", "test-pod-3"}
+
+		zero := int64(0)
+
+		ginkgo.By("Create set of pods")
+		// create a set of pods in test namespace
+		for _, podTestName := range podTestNames {
+			_, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(context.TODO(), &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: podTestName,
+					Labels: map[string]string{
+						"type": "Testing"},
+				},
+				Spec: v1.PodSpec{
+					TerminationGracePeriodSeconds: &zero,
+					Containers: []v1.Container{{
+						Image: imageutils.GetE2EImage(imageutils.Agnhost),
+						Name:  "token-test",
+					}},
+					RestartPolicy: v1.RestartPolicyNever,
+				}}, metav1.CreateOptions{})
+			framework.ExpectNoError(err, "failed to create pod")
+			framework.Logf("created %v", podTestName)
+		}
+
+		// wait as required for all 3 pods to be found
+		ginkgo.By("waiting for all 3 pods to be located")
+		err := wait.PollImmediate(podRetryPeriod, podRetryTimeout, checkPodListQuantity(f, "type=Testing", 3))
+		framework.ExpectNoError(err, "3 pods not found")
+
+		// delete Collection of pods with a label in the current namespace
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).DeleteCollection(context.TODO(), metav1.DeleteOptions{GracePeriodSeconds: &zero}, metav1.ListOptions{
+			LabelSelector: "type=Testing"})
+		framework.ExpectNoError(err, "failed to delete collection of pods")
+
+		// wait for all pods to be deleted
+		ginkgo.By("waiting for all pods to be deleted")
+		err = wait.PollImmediate(podRetryPeriod, podRetryTimeout, checkPodListQuantity(f, "type=Testing", 0))
+		framework.ExpectNoError(err, "found a pod(s)")
+	})
 })
+
+func checkPodListQuantity(f *framework.Framework, label string, quantity int) func() (bool, error) {
+	return func() (bool, error) {
+		var err error
+
+		list, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).List(context.TODO(), metav1.ListOptions{
+			LabelSelector: label})
+
+		if err != nil {
+			return false, err
+		}
+
+		if len(list.Items) != quantity {
+			framework.Logf("Pod quantity %d is different from expected quantity %d", len(list.Items), quantity)
+			return false, err
+		}
+		return true, nil
+	}
+}

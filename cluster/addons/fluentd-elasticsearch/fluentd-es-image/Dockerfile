@@ -1,4 +1,4 @@
-# Copyright 2016 The Kubernetes Authors.
+# Copyright 2017 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,28 +15,55 @@
 # This Dockerfile will build an image that is configured
 # to run Fluentd with an Elasticsearch plug-in and the
 # provided configuration file.
-# TODO(a-robinson): Use a lighter base image, e.g. some form of busybox.
 # The image acts as an executable for the binary /usr/sbin/td-agent.
 # Note that fluentd is run with root permssion to allow access to
 # log files with root only access under /var/log/containers/*
-# Please see http://docs.fluentd.org/articles/install-by-deb for more
-# information about installing fluentd using deb package.
 
-FROM gcr.io/google_containers/ubuntu-slim:0.4
-MAINTAINER Alex Robinson "arob@google.com"
-MAINTAINER Jimmi Dyson "jimmidyson@gmail.com"
+# 1. Install & configure dependencies.
+# 2. Install fluentd via ruby.
+# 3. Remove build dependencies.
+# 4. Cleanup leftover caches & files.
 
-# Ensure there are enough file descriptors for running Fluentd.
-RUN ulimit -n 65536
+FROM ruby:2.7-slim-buster as builder
 
-# Disable prompts from apt.
-ENV DEBIAN_FRONTEND noninteractive
+ARG DEBIAN_FRONTEND=noninteractive
 
-# Copy the Fluentd configuration file.
-COPY td-agent.conf /etc/td-agent/td-agent.conf
+COPY Gemfile /Gemfile
 
-COPY build.sh /tmp/build.sh
-RUN /tmp/build.sh
+SHELL ["/bin/bash", "-e", "-o", "pipefail", "-c"]
 
-# Run the Fluentd service.
-ENTRYPOINT ["td-agent"]
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends g++ gcc make && \
+    echo 'gem: --no-document' >> /etc/gemrc && \
+    gem install --file Gemfile
+
+
+FROM ruby:2.7-slim-buster
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Copy the Fluentd configuration file for logging Docker container logs.
+COPY fluent.conf /etc/fluent/fluent.conf
+COPY entrypoint.sh /entrypoint.sh
+COPY --from=builder /usr/local/bundle/ /usr/local/bundle 
+
+SHELL ["/bin/bash", "-e", "-o", "pipefail", "-c"]
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libjemalloc2 && \
+    apt-get clean -y && \
+    ulimit -n 65536 && \    
+    rm -rf \
+        /var/cache/debconf/* \
+        /var/lib/apt/lists/* \
+        /var/log/* \
+        /var/tmp/* \
+        rm -rf /tmp/*
+
+# Expose prometheus metrics.
+EXPOSE 80
+
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+
+# Start Fluentd to pick up our config that watches Docker container logs.
+CMD ["/entrypoint.sh"]

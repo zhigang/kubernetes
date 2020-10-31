@@ -3,14 +3,14 @@
 package libcontainer
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"syscall"
-)
 
-const oomCgroupName = "memory"
+	"golang.org/x/sys/unix"
+)
 
 type PressureLevel uint
 
@@ -25,13 +25,13 @@ func registerMemoryEvent(cgDir string, evName string, arg string) (<-chan struct
 	if err != nil {
 		return nil, err
 	}
-	fd, _, syserr := syscall.RawSyscall(syscall.SYS_EVENTFD2, 0, syscall.FD_CLOEXEC, 0)
-	if syserr != 0 {
+	fd, err := unix.Eventfd(0, unix.EFD_CLOEXEC)
+	if err != nil {
 		evFile.Close()
-		return nil, syserr
+		return nil, err
 	}
 
-	eventfd := os.NewFile(fd, "eventfd")
+	eventfd := os.NewFile(uintptr(fd), "eventfd")
 
 	eventControlPath := filepath.Join(cgDir, "cgroup.event_control")
 	data := fmt.Sprintf("%d %d %s", eventfd.Fd(), evFile.Fd(), arg)
@@ -43,9 +43,9 @@ func registerMemoryEvent(cgDir string, evName string, arg string) (<-chan struct
 	ch := make(chan struct{})
 	go func() {
 		defer func() {
-			close(ch)
 			eventfd.Close()
 			evFile.Close()
+			close(ch)
 		}()
 		buf := make([]byte, 8)
 		for {
@@ -65,19 +65,17 @@ func registerMemoryEvent(cgDir string, evName string, arg string) (<-chan struct
 
 // notifyOnOOM returns channel on which you can expect event about OOM,
 // if process died without OOM this channel will be closed.
-func notifyOnOOM(paths map[string]string) (<-chan struct{}, error) {
-	dir := paths[oomCgroupName]
+func notifyOnOOM(dir string) (<-chan struct{}, error) {
 	if dir == "" {
-		return nil, fmt.Errorf("path %q missing", oomCgroupName)
+		return nil, errors.New("memory controller missing")
 	}
 
 	return registerMemoryEvent(dir, "memory.oom_control", "")
 }
 
-func notifyMemoryPressure(paths map[string]string, level PressureLevel) (<-chan struct{}, error) {
-	dir := paths[oomCgroupName]
+func notifyMemoryPressure(dir string, level PressureLevel) (<-chan struct{}, error) {
 	if dir == "" {
-		return nil, fmt.Errorf("path %q missing", oomCgroupName)
+		return nil, errors.New("memory controller missing")
 	}
 
 	if level > CriticalPressure {

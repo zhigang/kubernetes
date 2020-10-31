@@ -17,75 +17,85 @@ limitations under the License.
 package integration
 
 import (
-	"fmt"
-	"math/rand"
+	"context"
 	"testing"
 	"time"
 
-	etcd "github.com/coreos/etcd/client"
-	"github.com/golang/glog"
-	"golang.org/x/net/context"
-	"k8s.io/kubernetes/pkg/api/errors"
-	coreclient "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_5/typed/core/v1"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/util/wait"
-	"k8s.io/kubernetes/test/integration/framework"
+	"google.golang.org/grpc"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/storage/storagebackend"
+	clientset "k8s.io/client-go/kubernetes"
+	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
+
+	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/pkg/transport"
 )
 
-func newEtcdClient() etcd.Client {
-	cfg := etcd.Config{
-		Endpoints: []string{framework.GetEtcdURLFromEnv()},
-	}
-	client, err := etcd.New(cfg)
-	if err != nil {
-		glog.Fatalf("unable to connect to etcd for testing: %v", err)
-	}
-	return client
-}
-
-func RequireEtcd() {
-	if _, err := etcd.NewKeysAPI(newEtcdClient()).Get(context.TODO(), "/", nil); err != nil {
-		glog.Fatalf("unable to connect to etcd for integration testing: %v", err)
-	}
-}
-
-func withEtcdKey(f func(string)) {
-	prefix := fmt.Sprintf("/test-%d", rand.Int63())
-	defer etcd.NewKeysAPI(newEtcdClient()).Delete(context.TODO(), prefix, &etcd.DeleteOptions{Recursive: true})
-	f(prefix)
-}
-
-func DeletePodOrErrorf(t *testing.T, c *client.Client, ns, name string) {
-	if err := c.Pods(ns).Delete(name, nil); err != nil {
+// DeletePodOrErrorf deletes a pod or fails with a call to t.Errorf.
+func DeletePodOrErrorf(t *testing.T, c clientset.Interface, ns, name string) {
+	if err := c.CoreV1().Pods(ns).Delete(context.TODO(), name, metav1.DeleteOptions{}); err != nil {
 		t.Errorf("unable to delete pod %v: %v", name, err)
 	}
 }
 
 // Requests to try.  Each one should be forbidden or not forbidden
 // depending on the authentication and authorization setup of the master.
-var Code200 = map[int]bool{200: true}
-var Code201 = map[int]bool{201: true}
-var Code400 = map[int]bool{400: true}
-var Code403 = map[int]bool{403: true}
-var Code404 = map[int]bool{404: true}
-var Code405 = map[int]bool{405: true}
-var Code409 = map[int]bool{409: true}
-var Code422 = map[int]bool{422: true}
-var Code500 = map[int]bool{500: true}
-var Code503 = map[int]bool{503: true}
+var (
+	Code200 = map[int]bool{200: true}
+	Code201 = map[int]bool{201: true}
+	Code400 = map[int]bool{400: true}
+	Code401 = map[int]bool{401: true}
+	Code403 = map[int]bool{403: true}
+	Code404 = map[int]bool{404: true}
+	Code405 = map[int]bool{405: true}
+	Code409 = map[int]bool{409: true}
+	Code422 = map[int]bool{422: true}
+	Code500 = map[int]bool{500: true}
+	Code503 = map[int]bool{503: true}
+)
 
 // WaitForPodToDisappear polls the API server if the pod has been deleted.
 func WaitForPodToDisappear(podClient coreclient.PodInterface, podName string, interval, timeout time.Duration) error {
 	return wait.PollImmediate(interval, timeout, func() (bool, error) {
-		_, err := podClient.Get(podName)
+		_, err := podClient.Get(context.TODO(), podName, metav1.GetOptions{})
 		if err == nil {
 			return false, nil
-		} else {
-			if errors.IsNotFound(err) {
-				return true, nil
-			} else {
-				return false, err
-			}
 		}
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
 	})
+}
+
+// GetEtcdClients returns an initialized  clientv3.Client and clientv3.KV.
+func GetEtcdClients(config storagebackend.TransportConfig) (*clientv3.Client, clientv3.KV, error) {
+	tlsInfo := transport.TLSInfo{
+		CertFile:      config.CertFile,
+		KeyFile:       config.KeyFile,
+		TrustedCAFile: config.TrustedCAFile,
+	}
+
+	tlsConfig, err := tlsInfo.ClientConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cfg := clientv3.Config{
+		Endpoints:   config.ServerList,
+		DialTimeout: 20 * time.Second,
+		DialOptions: []grpc.DialOption{
+			grpc.WithBlock(), // block until the underlying connection is up
+		},
+		TLS: tlsConfig,
+	}
+
+	c, err := clientv3.New(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return c, clientv3.NewKV(c), nil
 }

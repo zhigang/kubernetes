@@ -20,16 +20,17 @@ import (
 	"reflect"
 	"sync"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
-	"k8s.io/kubernetes/pkg/client/record"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/record"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	kubepod "k8s.io/kubernetes/pkg/kubelet/pod"
 	"k8s.io/kubernetes/pkg/kubelet/prober/results"
 	"k8s.io/kubernetes/pkg/kubelet/status"
+	statustest "k8s.io/kubernetes/pkg/kubelet/status/testing"
 	"k8s.io/kubernetes/pkg/probe"
-	"k8s.io/kubernetes/pkg/util/exec"
+	"k8s.io/utils/exec"
 )
 
 const (
@@ -39,27 +40,32 @@ const (
 
 var testContainerID = kubecontainer.ContainerID{Type: "test", ID: "cOnTaInEr_Id"}
 
-func getTestRunningStatus() api.PodStatus {
-	containerStatus := api.ContainerStatus{
+func getTestRunningStatus() v1.PodStatus {
+	return getTestRunningStatusWithStarted(true)
+}
+
+func getTestRunningStatusWithStarted(started bool) v1.PodStatus {
+	containerStatus := v1.ContainerStatus{
 		Name:        testContainerName,
 		ContainerID: testContainerID.String(),
 	}
-	containerStatus.State.Running = &api.ContainerStateRunning{StartedAt: unversioned.Now()}
-	podStatus := api.PodStatus{
-		Phase:             api.PodRunning,
-		ContainerStatuses: []api.ContainerStatus{containerStatus},
+	containerStatus.State.Running = &v1.ContainerStateRunning{StartedAt: metav1.Now()}
+	containerStatus.Started = &started
+	podStatus := v1.PodStatus{
+		Phase:             v1.PodRunning,
+		ContainerStatuses: []v1.ContainerStatus{containerStatus},
 	}
 	return podStatus
 }
 
-func getTestPod() *api.Pod {
-	container := api.Container{
+func getTestPod() *v1.Pod {
+	container := v1.Container{
 		Name: testContainerName,
 	}
-	pod := api.Pod{
-		Spec: api.PodSpec{
-			Containers:    []api.Container{container},
-			RestartPolicy: api.RestartPolicyNever,
+	pod := v1.Pod{
+		Spec: v1.PodSpec{
+			Containers:    []v1.Container{container},
+			RestartPolicy: v1.RestartPolicyNever,
 		},
 	}
 	pod.Name = "testPod"
@@ -67,10 +73,10 @@ func getTestPod() *api.Pod {
 	return &pod
 }
 
-func setTestProbe(pod *api.Pod, probeType probeType, probeSpec api.Probe) {
+func setTestProbe(pod *v1.Pod, probeType probeType, probeSpec v1.Probe) {
 	// All tests rely on the fake exec prober.
-	probeSpec.Handler = api.Handler{
-		Exec: &api.ExecAction{},
+	probeSpec.Handler = v1.Handler{
+		Exec: &v1.ExecAction{},
 	}
 
 	// Apply test defaults, overwridden for test speed.
@@ -92,20 +98,20 @@ func setTestProbe(pod *api.Pod, probeType probeType, probeSpec api.Probe) {
 		pod.Spec.Containers[0].ReadinessProbe = &probeSpec
 	case liveness:
 		pod.Spec.Containers[0].LivenessProbe = &probeSpec
+	case startup:
+		pod.Spec.Containers[0].StartupProbe = &probeSpec
 	}
 }
 
 func newTestManager() *manager {
-	refManager := kubecontainer.NewRefManager()
-	refManager.SetRef(testContainerID, &api.ObjectReference{}) // Suppress prober warnings.
-	podManager := kubepod.NewBasicPodManager(nil)
+	podManager := kubepod.NewBasicPodManager(nil, nil, nil)
 	// Add test pod to pod manager, so that status manager can get the pod from pod manager if needed.
 	podManager.AddPod(getTestPod())
 	m := NewManager(
-		status.NewManager(&fake.Clientset{}, podManager),
+		status.NewManager(&fake.Clientset{}, podManager, &statustest.FakePodDeletionSafetyProvider{}),
+		results.NewManager(),
 		results.NewManager(),
 		nil, // runner
-		refManager,
 		&record.FakeRecorder{},
 	).(*manager)
 	// Don't actually execute probes.
@@ -113,7 +119,7 @@ func newTestManager() *manager {
 	return m
 }
 
-func newTestWorker(m *manager, probeType probeType, probeSpec api.Probe) *worker {
+func newTestWorker(m *manager, probeType probeType, probeSpec v1.Probe) *worker {
 	pod := getTestPod()
 	setTestProbe(pod, probeType, probeSpec)
 	return newWorker(m, probeType, pod, pod.Spec.Containers[0])
@@ -124,7 +130,7 @@ type fakeExecProber struct {
 	err    error
 }
 
-func (p fakeExecProber) Probe(_ exec.Cmd) (probe.Result, string, error) {
+func (p fakeExecProber) Probe(c exec.Cmd) (probe.Result, string, error) {
 	return p.result, "", p.err
 }
 

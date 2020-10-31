@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors.
+Copyright 2020 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,70 +14,95 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package v1beta1_test
+package v1beta1
 
 import (
-	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/apis/batch"
-	versioned "k8s.io/kubernetes/pkg/apis/extensions/v1beta1"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"k8s.io/api/extensions/v1beta1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/kubernetes/pkg/apis/networking"
 )
 
-// TestJobSpecConversion tests that ManualSelector and AutoSelector
-// are handled correctly.
-func TestJobSpecConversion(t *testing.T) {
-	pTrue := new(bool)
-	*pTrue = true
-	pFalse := new(bool)
-	*pFalse = false
+func TestIngressBackendConversion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	assert.NoError(t, RegisterConversions(scheme))
 
-	// False or nil convert to true.
-	// True converts to nil.
-	tests := []struct {
-		in        *bool
-		expectOut *bool
+	tests := map[string]struct {
+		external v1beta1.IngressSpec
+		internal networking.IngressSpec
 	}{
-		{
-			in:        nil,
-			expectOut: pTrue,
+		"service-port-number": {
+			external: v1beta1.IngressSpec{
+				Backend: &v1beta1.IngressBackend{
+					ServiceName: "test-backend",
+					ServicePort: intstr.FromInt(8080),
+				},
+			},
+			internal: networking.IngressSpec{
+				DefaultBackend: &networking.IngressBackend{
+					Service: &networking.IngressServiceBackend{
+						Name: "test-backend",
+						Port: networking.ServiceBackendPort{
+							Name:   "",
+							Number: 8080,
+						},
+					},
+				},
+			},
 		},
-		{
-			in:        pFalse,
-			expectOut: pTrue,
+		"service-named-port": {
+			external: v1beta1.IngressSpec{
+				Backend: &v1beta1.IngressBackend{
+					ServiceName: "test-backend",
+					ServicePort: intstr.FromString("https"),
+				},
+			},
+			internal: networking.IngressSpec{
+				DefaultBackend: &networking.IngressBackend{
+					Service: &networking.IngressServiceBackend{
+						Name: "test-backend",
+						Port: networking.ServiceBackendPort{
+							Name: "https",
+						},
+					},
+				},
+			},
 		},
-		{
-			in:        pTrue,
-			expectOut: nil,
+		"empty-service-name": {
+			external: v1beta1.IngressSpec{
+				Backend: &v1beta1.IngressBackend{
+					ServiceName: "",
+					ServicePort: intstr.FromString("https"),
+				},
+			},
+			internal: networking.IngressSpec{
+				DefaultBackend: &networking.IngressBackend{
+					Service: &networking.IngressServiceBackend{
+						Name: "",
+						Port: networking.ServiceBackendPort{
+							Name: "https",
+						},
+					},
+				},
+			},
 		},
 	}
 
-	// Test internal -> v1beta1.
-	for _, test := range tests {
-		i := &batch.JobSpec{
-			ManualSelector: test.in,
-		}
-		v := versioned.JobSpec{}
-		if err := api.Scheme.Convert(i, &v, nil); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !reflect.DeepEqual(test.expectOut, v.AutoSelector) {
-			t.Fatalf("want v1beta1.AutoSelector %v, got %v", test.expectOut, v.AutoSelector)
-		}
-	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			convertedInternal := networking.IngressSpec{}
+			require.NoError(t,
+				Convert_v1beta1_IngressSpec_To_networking_IngressSpec(&test.external, &convertedInternal, nil))
+			assert.Equal(t, test.internal, convertedInternal, "v1beta1.IngressSpec -> networking.IngressSpec")
 
-	// Test v1beta1 -> internal.
-	for _, test := range tests {
-		i := &versioned.JobSpec{
-			AutoSelector: test.in,
-		}
-		e := batch.JobSpec{}
-		if err := api.Scheme.Convert(i, &e, nil); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !reflect.DeepEqual(test.expectOut, e.ManualSelector) {
-			t.Fatalf("want extensions.ManualSelector %v, got %v", test.expectOut, e.ManualSelector)
-		}
+			convertedV1beta1 := v1beta1.IngressSpec{}
+			require.NoError(t,
+				Convert_networking_IngressSpec_To_v1beta1_IngressSpec(&test.internal, &convertedV1beta1, nil))
+			assert.Equal(t, test.external, convertedV1beta1, "networking.IngressSpec -> v1beta1.IngressSpec")
+		})
 	}
 }

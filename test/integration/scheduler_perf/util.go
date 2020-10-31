@@ -17,154 +17,268 @@ limitations under the License.
 package benchmark
 
 import (
-	"net/http"
-	"net/http/httptest"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"math"
+	"path"
+	"sort"
+	"time"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/pkg/client/record"
-	"k8s.io/kubernetes/pkg/client/restclient"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/master"
-	"k8s.io/kubernetes/pkg/util/workqueue"
-	"k8s.io/kubernetes/plugin/pkg/scheduler"
-	_ "k8s.io/kubernetes/plugin/pkg/scheduler/algorithmprovider"
-	"k8s.io/kubernetes/plugin/pkg/scheduler/factory"
-	e2e "k8s.io/kubernetes/test/e2e/framework"
-	"k8s.io/kubernetes/test/integration/framework"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	clientset "k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/component-base/metrics/legacyregistry"
+	"k8s.io/component-base/metrics/testutil"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/test/integration/util"
+	testutils "k8s.io/kubernetes/test/utils"
 )
+
+const (
+	dateFormat                = "2006-01-02T15:04:05Z"
+	testNamespace             = "sched-test"
+	setupNamespace            = "sched-setup"
+	throughputSampleFrequency = time.Second
+)
+
+var dataItemsDir = flag.String("data-items-dir", "", "destination directory for storing generated data items for perf dashboard")
 
 // mustSetupScheduler starts the following components:
 // - k8s api server (a.k.a. master)
 // - scheduler
-// It returns scheduler config factory and destroyFunc which should be used to
+// It returns clientset and destroyFunc which should be used to
 // remove resources after finished.
 // Notes on rate limiter:
 //   - client rate limit is set to 5000.
-func mustSetupScheduler() (schedulerConfigFactory *factory.ConfigFactory, destroyFunc func()) {
-	// framework.DeleteAllEtcdKeys()
-
-	var m *master.Master
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	m, err := master.New(masterConfig)
-	if err != nil {
-		panic("error in brining up the master: " + err.Error())
-	}
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		m.Handler.ServeHTTP(w, req)
-	}))
-
-	c := client.NewOrDie(&restclient.Config{
-		Host:          s.URL,
-		ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()},
+func mustSetupScheduler() (util.ShutdownFunc, coreinformers.PodInformer, clientset.Interface) {
+	apiURL, apiShutdown := util.StartApiserver()
+	clientSet := clientset.NewForConfigOrDie(&restclient.Config{
+		Host:          apiURL,
+		ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}},
 		QPS:           5000.0,
 		Burst:         5000,
 	})
+	_, podInformer, schedulerShutdown := util.StartScheduler(clientSet)
+	fakePVControllerShutdown := util.StartFakePVController(clientSet)
 
-	schedulerConfigFactory = factory.NewConfigFactory(c, api.DefaultSchedulerName, api.DefaultHardPodAffinitySymmetricWeight, api.DefaultFailureDomains)
-	schedulerConfig, err := schedulerConfigFactory.Create()
+	shutdownFunc := func() {
+		fakePVControllerShutdown()
+		schedulerShutdown()
+		apiShutdown()
+	}
+
+	return shutdownFunc, podInformer, clientSet
+}
+
+// Returns the list of scheduled pods in the specified namespaces.
+// Note that no namespces specified matches all namespaces.
+func getScheduledPods(podInformer coreinformers.PodInformer, namespaces ...string) ([]*v1.Pod, error) {
+	pods, err := podInformer.Lister().List(labels.Everything())
 	if err != nil {
-		panic("Couldn't create scheduler config")
+		return nil, err
 	}
-	eventBroadcaster := record.NewBroadcaster()
-	schedulerConfig.Recorder = eventBroadcaster.NewRecorder(api.EventSource{Component: "scheduler"})
-	eventBroadcaster.StartRecordingToSink(c.Events(""))
-	scheduler.New(schedulerConfig).Run()
 
-	destroyFunc = func() {
-		glog.Infof("destroying")
-		close(schedulerConfig.StopEverything)
-		s.Close()
-		glog.Infof("destroyed")
-	}
-	return
-}
-
-func makeNodes(c client.Interface, nodeCount int) {
-	glog.Infof("making %d nodes", nodeCount)
-	baseNode := &api.Node{
-		ObjectMeta: api.ObjectMeta{
-			GenerateName: "scheduler-test-node-",
-		},
-		Spec: api.NodeSpec{
-			ExternalID: "foobar",
-		},
-		Status: api.NodeStatus{
-			Capacity: api.ResourceList{
-				api.ResourcePods:   *resource.NewQuantity(110, resource.DecimalSI),
-				api.ResourceCPU:    resource.MustParse("4"),
-				api.ResourceMemory: resource.MustParse("32Gi"),
-			},
-			Phase: api.NodeRunning,
-			Conditions: []api.NodeCondition{
-				{Type: api.NodeReady, Status: api.ConditionTrue},
-			},
-		},
-	}
-	for i := 0; i < nodeCount; i++ {
-		if _, err := c.Nodes().Create(baseNode); err != nil {
-			panic("error creating node: " + err.Error())
+	s := sets.NewString(namespaces...)
+	scheduled := make([]*v1.Pod, 0, len(pods))
+	for i := range pods {
+		pod := pods[i]
+		if len(pod.Spec.NodeName) > 0 && (len(s) == 0 || s.Has(pod.Namespace)) {
+			scheduled = append(scheduled, pod)
 		}
 	}
+	return scheduled, nil
 }
 
-func makePodSpec() api.PodSpec {
-	return api.PodSpec{
-		Containers: []api.Container{{
-			Name:  "pause",
-			Image: e2e.GetPauseImageNameForHostArch(),
-			Ports: []api.ContainerPort{{ContainerPort: 80}},
-			Resources: api.ResourceRequirements{
-				Limits: api.ResourceList{
-					api.ResourceCPU:    resource.MustParse("100m"),
-					api.ResourceMemory: resource.MustParse("500Mi"),
-				},
-				Requests: api.ResourceList{
-					api.ResourceCPU:    resource.MustParse("100m"),
-					api.ResourceMemory: resource.MustParse("500Mi"),
-				},
-			},
-		}},
+// DataItem is the data point.
+type DataItem struct {
+	// Data is a map from bucket to real data point (e.g. "Perc90" -> 23.5). Notice
+	// that all data items with the same label combination should have the same buckets.
+	Data map[string]float64 `json:"data"`
+	// Unit is the data unit. Notice that all data items with the same label combination
+	// should have the same unit.
+	Unit string `json:"unit"`
+	// Labels is the labels of the data item.
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
+// DataItems is the data point set. It is the struct that perf dashboard expects.
+type DataItems struct {
+	Version   string     `json:"version"`
+	DataItems []DataItem `json:"dataItems"`
+}
+
+// makeBasePod creates a Pod object to be used as a template.
+func makeBasePod() *v1.Pod {
+	basePod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "pod-",
+		},
+		Spec: testutils.MakePodSpec(),
+	}
+	return basePod
+}
+
+func dataItems2JSONFile(dataItems DataItems, namePrefix string) error {
+	b, err := json.Marshal(dataItems)
+	if err != nil {
+		return err
+	}
+
+	destFile := fmt.Sprintf("%v_%v.json", namePrefix, time.Now().Format(dateFormat))
+	if *dataItemsDir != "" {
+		destFile = path.Join(*dataItemsDir, destFile)
+	}
+
+	return ioutil.WriteFile(destFile, b, 0644)
+}
+
+// metricsCollectorConfig is the config to be marshalled to YAML config file.
+type metricsCollectorConfig struct {
+	Metrics []string
+}
+
+// metricsCollector collects metrics from legacyregistry.DefaultGatherer.Gather() endpoint.
+// Currently only Histrogram metrics are supported.
+type metricsCollector struct {
+	*metricsCollectorConfig
+	labels map[string]string
+}
+
+func newMetricsCollector(config *metricsCollectorConfig, labels map[string]string) *metricsCollector {
+	return &metricsCollector{
+		metricsCollectorConfig: config,
+		labels:                 labels,
 	}
 }
 
-// makePodsFromRC will create a ReplicationController object and
-// a given number of pods (imitating the controller).
-func makePodsFromRC(c client.Interface, name string, podCount int) {
-	rc := &api.ReplicationController{
-		ObjectMeta: api.ObjectMeta{
-			Name: name,
-		},
-		Spec: api.ReplicationControllerSpec{
-			Replicas: int32(podCount),
-			Selector: map[string]string{"name": name},
-			Template: &api.PodTemplateSpec{
-				ObjectMeta: api.ObjectMeta{
-					Labels: map[string]string{"name": name},
-				},
-				Spec: makePodSpec(),
-			},
-		},
+func (*metricsCollector) run(ctx context.Context) {
+	// metricCollector doesn't need to start before the tests, so nothing to do here.
+}
+
+func (pc *metricsCollector) collect() []DataItem {
+	var dataItems []DataItem
+	for _, metric := range pc.Metrics {
+		dataItem := collectHistogram(metric, pc.labels)
+		if dataItem != nil {
+			dataItems = append(dataItems, *dataItem)
+		}
 	}
-	if _, err := c.ReplicationControllers("default").Create(rc); err != nil {
-		glog.Fatalf("unexpected error: %v", err)
+	return dataItems
+}
+
+func collectHistogram(metric string, labels map[string]string) *DataItem {
+	hist, err := testutil.GetHistogramFromGatherer(legacyregistry.DefaultGatherer, metric)
+	if err != nil {
+		klog.Error(err)
+		return nil
+	}
+	if hist.Histogram == nil {
+		klog.Errorf("metric %q is not a Histogram metric", metric)
+		return nil
+	}
+	if err := hist.Validate(); err != nil {
+		klog.Error(err)
+		return nil
 	}
 
-	basePod := &api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			GenerateName: "scheduler-test-pod-",
-			Labels:       map[string]string{"name": name},
-		},
-		Spec: makePodSpec(),
+	q50 := hist.Quantile(0.50)
+	q90 := hist.Quantile(0.90)
+	q99 := hist.Quantile(0.95)
+	avg := hist.Average()
+
+	// clear the metrics so that next test always starts with empty prometheus
+	// metrics (since the metrics are shared among all tests run inside the same binary)
+	hist.Clear()
+
+	msFactor := float64(time.Second) / float64(time.Millisecond)
+
+	// Copy labels and add "Metric" label for this metric.
+	labelMap := map[string]string{"Metric": metric}
+	for k, v := range labels {
+		labelMap[k] = v
 	}
-	createPod := func(i int) {
-		for {
-			if _, err := c.Pods("default").Create(basePod); err == nil {
-				break
+	return &DataItem{
+		Labels: labelMap,
+		Data: map[string]float64{
+			"Perc50":  q50 * msFactor,
+			"Perc90":  q90 * msFactor,
+			"Perc99":  q99 * msFactor,
+			"Average": avg * msFactor,
+		},
+		Unit: "ms",
+	}
+}
+
+type throughputCollector struct {
+	podInformer           coreinformers.PodInformer
+	schedulingThroughputs []float64
+	labels                map[string]string
+	namespaces            []string
+}
+
+func newThroughputCollector(podInformer coreinformers.PodInformer, labels map[string]string, namespaces []string) *throughputCollector {
+	return &throughputCollector{
+		podInformer: podInformer,
+		labels:      labels,
+		namespaces:  namespaces,
+	}
+}
+
+func (tc *throughputCollector) run(ctx context.Context) {
+	podsScheduled, err := getScheduledPods(tc.podInformer, tc.namespaces...)
+	if err != nil {
+		klog.Fatalf("%v", err)
+	}
+	lastScheduledCount := len(podsScheduled)
+	ticker := time.NewTicker(throughputSampleFrequency)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			podsScheduled, err := getScheduledPods(tc.podInformer, tc.namespaces...)
+			if err != nil {
+				klog.Fatalf("%v", err)
 			}
+
+			scheduled := len(podsScheduled)
+			samplingRatioSeconds := float64(throughputSampleFrequency) / float64(time.Second)
+			throughput := float64(scheduled-lastScheduledCount) / samplingRatioSeconds
+			tc.schedulingThroughputs = append(tc.schedulingThroughputs, throughput)
+			lastScheduledCount = scheduled
+
+			klog.Infof("%d pods scheduled", lastScheduledCount)
 		}
 	}
-	workqueue.Parallelize(30, podCount, createPod)
+}
+
+func (tc *throughputCollector) collect() []DataItem {
+	throughputSummary := DataItem{Labels: tc.labels}
+	if length := len(tc.schedulingThroughputs); length > 0 {
+		sort.Float64s(tc.schedulingThroughputs)
+		sum := 0.0
+		for i := range tc.schedulingThroughputs {
+			sum += tc.schedulingThroughputs[i]
+		}
+
+		throughputSummary.Labels["Metric"] = "SchedulingThroughput"
+		throughputSummary.Data = map[string]float64{
+			"Average": sum / float64(length),
+			"Perc50":  tc.schedulingThroughputs[int(math.Ceil(float64(length*50)/100))-1],
+			"Perc90":  tc.schedulingThroughputs[int(math.Ceil(float64(length*90)/100))-1],
+			"Perc99":  tc.schedulingThroughputs[int(math.Ceil(float64(length*99)/100))-1],
+		}
+		throughputSummary.Unit = "pods/s"
+	}
+
+	return []DataItem{throughputSummary}
 }

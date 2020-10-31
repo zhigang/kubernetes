@@ -18,11 +18,12 @@ package flocker
 
 import (
 	"fmt"
+	"os"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/resource"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/kubernetes/pkg/volume"
+	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -31,19 +32,19 @@ func TestFlockerUtil_CreateVolume(t *testing.T) {
 	assert := assert.New(t)
 
 	// test CreateVolume happy path
+	pvc := volumetest.CreateTestPVC("3Gi", []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce})
 	options := volume.VolumeOptions{
-		Capacity: resource.MustParse("3Gi"),
-		AccessModes: []api.PersistentVolumeAccessMode{
-			api.ReadWriteOnce,
-		},
-		PersistentVolumeReclaimPolicy: api.PersistentVolumeReclaimDelete,
+		PVC:                           pvc,
+		PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimDelete,
 	}
 
 	fakeFlockerClient := newFakeFlockerClient()
-	provisioner := newTestableProvisioner(assert, options).(*flockerVolumeProvisioner)
+	dir, p := newTestableProvisioner(t, assert, options)
+	provisioner := p.(*flockerVolumeProvisioner)
+	defer os.RemoveAll(dir)
 	provisioner.flockerClient = fakeFlockerClient
 
-	flockerUtil := &FlockerUtil{}
+	flockerUtil := &flockerUtil{}
 
 	datasetID, size, _, err := flockerUtil.CreateVolume(provisioner)
 	assert.NoError(err)

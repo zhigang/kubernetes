@@ -20,8 +20,9 @@ import (
 	"strconv"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/resource"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/kubernetes/pkg/apis/scheduling"
 )
 
 const (
@@ -29,13 +30,13 @@ const (
 )
 
 var (
-	cpuLimit = api.Pod{
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+	cpuLimit = v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
-					Resources: api.ResourceRequirements{
-						Limits: api.ResourceList{
-							api.ResourceName(api.ResourceCPU): resource.MustParse("10"),
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceName(v1.ResourceCPU): resource.MustParse("10"),
 						},
 					},
 				},
@@ -43,16 +44,16 @@ var (
 		},
 	}
 
-	memoryLimitCPURequest = api.Pod{
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+	memoryLimitCPURequest = v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
-					Resources: api.ResourceRequirements{
-						Requests: api.ResourceList{
-							api.ResourceName(api.ResourceCPU): resource.MustParse("0"),
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceName(v1.ResourceCPU): resource.MustParse("0"),
 						},
-						Limits: api.ResourceList{
-							api.ResourceName(api.ResourceMemory): resource.MustParse("10G"),
+						Limits: v1.ResourceList{
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
 						},
 					},
 				},
@@ -60,13 +61,13 @@ var (
 		},
 	}
 
-	zeroMemoryLimit = api.Pod{
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+	zeroMemoryLimit = v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
-					Resources: api.ResourceRequirements{
-						Limits: api.ResourceList{
-							api.ResourceName(api.ResourceMemory): resource.MustParse("0"),
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse("0"),
 						},
 					},
 				},
@@ -74,28 +75,28 @@ var (
 		},
 	}
 
-	noRequestLimit = api.Pod{
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+	noRequestLimit = v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
-					Resources: api.ResourceRequirements{},
+					Resources: v1.ResourceRequirements{},
 				},
 			},
 		},
 	}
 
-	equalRequestLimitCPUMemory = api.Pod{
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+	equalRequestLimitCPUMemory = v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
-					Resources: api.ResourceRequirements{
-						Requests: api.ResourceList{
-							api.ResourceName(api.ResourceMemory): resource.MustParse("10G"),
-							api.ResourceName(api.ResourceCPU):    resource.MustParse("5m"),
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
+							v1.ResourceName(v1.ResourceCPU):    resource.MustParse("5m"),
 						},
-						Limits: api.ResourceList{
-							api.ResourceName(api.ResourceCPU):    resource.MustParse("5m"),
-							api.ResourceName(api.ResourceMemory): resource.MustParse("10G"),
+						Limits: v1.ResourceList{
+							v1.ResourceName(v1.ResourceCPU):    resource.MustParse("5m"),
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
 						},
 					},
 				},
@@ -103,17 +104,17 @@ var (
 		},
 	}
 
-	cpuUnlimitedMemoryLimitedWithRequests = api.Pod{
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+	cpuUnlimitedMemoryLimitedWithRequests = v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
-					Resources: api.ResourceRequirements{
-						Requests: api.ResourceList{
-							api.ResourceName(api.ResourceMemory): resource.MustParse(strconv.Itoa(standardMemoryAmount / 2)),
-							api.ResourceName(api.ResourceCPU):    resource.MustParse("5m"),
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse(strconv.FormatInt(standardMemoryAmount/2, 10)),
+							v1.ResourceName(v1.ResourceCPU):    resource.MustParse("5m"),
 						},
-						Limits: api.ResourceList{
-							api.ResourceName(api.ResourceMemory): resource.MustParse("10G"),
+						Limits: v1.ResourceList{
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse("10G"),
 						},
 					},
 				},
@@ -121,16 +122,29 @@ var (
 		},
 	}
 
-	requestNoLimit = api.Pod{
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+	requestNoLimit = v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
-					Resources: api.ResourceRequirements{
-						Requests: api.ResourceList{
-							api.ResourceName(api.ResourceMemory): resource.MustParse(strconv.Itoa(standardMemoryAmount - 1)),
-							api.ResourceName(api.ResourceCPU):    resource.MustParse("5m"),
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceName(v1.ResourceMemory): resource.MustParse(strconv.FormatInt(standardMemoryAmount-1, 10)),
+							v1.ResourceName(v1.ResourceCPU):    resource.MustParse("5m"),
 						},
 					},
+				},
+			},
+		},
+	}
+
+	systemCritical = scheduling.SystemCriticalPriority
+
+	critical = v1.Pod{
+		Spec: v1.PodSpec{
+			Priority: &systemCritical,
+			Containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{},
 				},
 			},
 		},
@@ -138,7 +152,7 @@ var (
 )
 
 type oomTest struct {
-	pod             *api.Pod
+	pod             *v1.Pod
 	memoryCapacity  int64
 	lowOOMScoreAdj  int // The max oom_score_adj score the container should be assigned.
 	highOOMScoreAdj int // The min oom_score_adj score the container should be assigned.
@@ -173,8 +187,8 @@ func TestGetContainerOOMScoreAdjust(t *testing.T) {
 		{
 			pod:             &equalRequestLimitCPUMemory,
 			memoryCapacity:  123456789,
-			lowOOMScoreAdj:  -998,
-			highOOMScoreAdj: -998,
+			lowOOMScoreAdj:  -997,
+			highOOMScoreAdj: -997,
 		},
 		{
 			pod:             &cpuUnlimitedMemoryLimitedWithRequests,
@@ -185,8 +199,14 @@ func TestGetContainerOOMScoreAdjust(t *testing.T) {
 		{
 			pod:             &requestNoLimit,
 			memoryCapacity:  standardMemoryAmount,
-			lowOOMScoreAdj:  2,
-			highOOMScoreAdj: 2,
+			lowOOMScoreAdj:  3,
+			highOOMScoreAdj: 3,
+		},
+		{
+			pod:             &critical,
+			memoryCapacity:  4000000000,
+			lowOOMScoreAdj:  -997,
+			highOOMScoreAdj: -997,
 		},
 	}
 	for _, test := range oomTests {

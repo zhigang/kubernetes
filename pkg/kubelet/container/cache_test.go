@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"k8s.io/kubernetes/pkg/types"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func newTestCache() *cache {
@@ -49,7 +49,7 @@ func getTestPodIDAndStatus(numContainers int) (types.UID, *PodStatus) {
 		status = &PodStatus{ID: id}
 	}
 	for i := 0; i < numContainers; i++ {
-		status.ContainerStatuses = append(status.ContainerStatuses, &ContainerStatus{Name: string(i)})
+		status.ContainerStatuses = append(status.ContainerStatuses, &Status{Name: strconv.Itoa(i)})
 	}
 	return id, status
 }

@@ -19,13 +19,17 @@ package types
 import (
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/kubernetes/pkg/apis/scheduling"
 )
 
-const ConfigSourceAnnotationKey = "kubernetes.io/config.source"
-const ConfigMirrorAnnotationKey = "kubernetes.io/config.mirror"
-const ConfigFirstSeenAnnotationKey = "kubernetes.io/config.seen"
-const ConfigHashAnnotationKey = "kubernetes.io/config.hash"
+const (
+	ConfigSourceAnnotationKey    = "kubernetes.io/config.source"
+	ConfigMirrorAnnotationKey    = v1.MirrorPodAnnotationKey
+	ConfigFirstSeenAnnotationKey = "kubernetes.io/config.seen"
+	ConfigHashAnnotationKey      = "kubernetes.io/config.hash"
+)
 
 // PodOperation defines what changes will be made on a pod configuration.
 type PodOperation int
@@ -55,7 +59,7 @@ const (
 	// Updates from all sources
 	AllSource = "*"
 
-	NamespaceDefault = api.NamespaceDefault
+	NamespaceDefault = metav1.NamespaceDefault
 )
 
 // PodUpdate defines an operation sent on the channel. You can add or remove single services by
@@ -68,7 +72,7 @@ const (
 // functionally similar, this helps our unit tests properly check that the correct PodUpdates
 // are generated.
 type PodUpdate struct {
-	Pods   []*api.Pod
+	Pods   []*v1.Pod
 	Op     PodOperation
 	Source string
 }
@@ -82,9 +86,8 @@ func GetValidatedSources(sources []string) ([]string, error) {
 			return []string{FileSource, HTTPSource, ApiserverSource}, nil
 		case FileSource, HTTPSource, ApiserverSource:
 			validated = append(validated, source)
-			break
 		case "":
-			break
+			// Skip
 		default:
 			return []string{}, fmt.Errorf("unknown pod source %q", source)
 		}
@@ -93,7 +96,7 @@ func GetValidatedSources(sources []string) ([]string, error) {
 }
 
 // GetPodSource returns the source of the pod based on the annotation.
-func GetPodSource(pod *api.Pod) (string, error) {
+func GetPodSource(pod *v1.Pod) (string, error) {
 	if pod.Annotations != nil {
 		if source, ok := pod.Annotations[ConfigSourceAnnotationKey]; ok {
 			return source, nil
@@ -130,4 +133,49 @@ func (sp SyncPodType) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+// IsMirrorPod returns true if the passed Pod is a Mirror Pod.
+func IsMirrorPod(pod *v1.Pod) bool {
+	_, ok := pod.Annotations[ConfigMirrorAnnotationKey]
+	return ok
+}
+
+// IsStaticPod returns true if the pod is a static pod.
+func IsStaticPod(pod *v1.Pod) bool {
+	source, err := GetPodSource(pod)
+	return err == nil && source != ApiserverSource
+}
+
+// IsCriticalPod returns true if pod's priority is greater than or equal to SystemCriticalPriority.
+func IsCriticalPod(pod *v1.Pod) bool {
+	if IsStaticPod(pod) {
+		return true
+	}
+	if IsMirrorPod(pod) {
+		return true
+	}
+	if pod.Spec.Priority != nil && IsCriticalPodBasedOnPriority(*pod.Spec.Priority) {
+		return true
+	}
+	return false
+}
+
+// Preemptable returns true if preemptor pod can preempt preemptee pod
+// if preemptee is not critical or if preemptor's priority is greater than preemptee's priority
+func Preemptable(preemptor, preemptee *v1.Pod) bool {
+	if IsCriticalPod(preemptor) && !IsCriticalPod(preemptee) {
+		return true
+	}
+	if (preemptor != nil && preemptor.Spec.Priority != nil) &&
+		(preemptee != nil && preemptee.Spec.Priority != nil) {
+		return *(preemptor.Spec.Priority) > *(preemptee.Spec.Priority)
+	}
+
+	return false
+}
+
+// IsCriticalPodBasedOnPriority checks if the given pod is a critical pod based on priority resolved from pod Spec.
+func IsCriticalPodBasedOnPriority(priority int32) bool {
+	return priority >= scheduling.SystemCriticalPriority
 }

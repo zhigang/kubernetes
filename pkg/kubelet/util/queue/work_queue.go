@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util/clock"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/clock"
 )
 
 // WorkQueue allows queuing items with a timestamp. An item is
@@ -41,6 +41,7 @@ type basicWorkQueue struct {
 
 var _ WorkQueue = &basicWorkQueue{}
 
+// NewBasicWorkQueue returns a new basic WorkQueue with the provided clock
 func NewBasicWorkQueue(clock clock.Clock) WorkQueue {
 	queue := make(map[types.UID]time.Time)
 	return &basicWorkQueue{queue: queue, clock: clock}

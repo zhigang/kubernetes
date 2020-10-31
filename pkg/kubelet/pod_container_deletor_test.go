@@ -26,7 +26,7 @@ import (
 
 func TestGetContainersToDeleteInPodWithFilter(t *testing.T) {
 	pod := kubecontainer.PodStatus{
-		ContainerStatuses: []*kubecontainer.ContainerStatus{
+		ContainerStatuses: []*kubecontainer.Status{
 			{
 				ID:        kubecontainer.ContainerID{Type: "test", ID: "1"},
 				Name:      "foo",
@@ -66,15 +66,15 @@ func TestGetContainersToDeleteInPodWithFilter(t *testing.T) {
 	}{
 		{
 			0,
-			[]*kubecontainer.ContainerStatus{pod.ContainerStatuses[3], pod.ContainerStatuses[2], pod.ContainerStatuses[1]},
+			[]*kubecontainer.Status{pod.ContainerStatuses[3], pod.ContainerStatuses[2], pod.ContainerStatuses[1]},
 		},
 		{
 			1,
-			[]*kubecontainer.ContainerStatus{pod.ContainerStatuses[2], pod.ContainerStatuses[1]},
+			[]*kubecontainer.Status{pod.ContainerStatuses[2], pod.ContainerStatuses[1]},
 		},
 		{
 			2,
-			[]*kubecontainer.ContainerStatus{pod.ContainerStatuses[1]},
+			[]*kubecontainer.Status{pod.ContainerStatuses[1]},
 		},
 	}
 
@@ -88,7 +88,7 @@ func TestGetContainersToDeleteInPodWithFilter(t *testing.T) {
 
 func TestGetContainersToDeleteInPod(t *testing.T) {
 	pod := kubecontainer.PodStatus{
-		ContainerStatuses: []*kubecontainer.ContainerStatus{
+		ContainerStatuses: []*kubecontainer.Status{
 			{
 				ID:        kubecontainer.ContainerID{Type: "test", ID: "1"},
 				Name:      "foo",
@@ -128,15 +128,15 @@ func TestGetContainersToDeleteInPod(t *testing.T) {
 	}{
 		{
 			0,
-			[]*kubecontainer.ContainerStatus{pod.ContainerStatuses[3], pod.ContainerStatuses[2], pod.ContainerStatuses[1], pod.ContainerStatuses[0]},
+			[]*kubecontainer.Status{pod.ContainerStatuses[3], pod.ContainerStatuses[2], pod.ContainerStatuses[1], pod.ContainerStatuses[0]},
 		},
 		{
 			1,
-			[]*kubecontainer.ContainerStatus{pod.ContainerStatuses[2], pod.ContainerStatuses[1], pod.ContainerStatuses[0]},
+			[]*kubecontainer.Status{pod.ContainerStatuses[2], pod.ContainerStatuses[1], pod.ContainerStatuses[0]},
 		},
 		{
 			2,
-			[]*kubecontainer.ContainerStatus{pod.ContainerStatuses[1], pod.ContainerStatuses[0]},
+			[]*kubecontainer.Status{pod.ContainerStatuses[1], pod.ContainerStatuses[0]},
 		},
 	}
 
@@ -150,7 +150,7 @@ func TestGetContainersToDeleteInPod(t *testing.T) {
 
 func TestGetContainersToDeleteInPodWithNoMatch(t *testing.T) {
 	pod := kubecontainer.PodStatus{
-		ContainerStatuses: []*kubecontainer.ContainerStatus{
+		ContainerStatuses: []*kubecontainer.Status{
 			{
 				ID:        kubecontainer.ContainerID{Type: "test", ID: "1"},
 				Name:      "foo",
@@ -185,17 +185,17 @@ func TestGetContainersToDeleteInPodWithNoMatch(t *testing.T) {
 	}
 
 	testCases := []struct {
-		filterId                   string
+		filterID                   string
 		expectedContainersToDelete containerStatusbyCreatedList
 	}{
 		{
 			"abc",
-			[]*kubecontainer.ContainerStatus{},
+			[]*kubecontainer.Status{},
 		},
 	}
 
 	for _, test := range testCases {
-		candidates := getContainersToDeleteInPod(test.filterId, &pod, len(pod.ContainerStatuses))
+		candidates := getContainersToDeleteInPod(test.filterID, &pod, len(pod.ContainerStatuses))
 		if !reflect.DeepEqual(candidates, test.expectedContainersToDelete) {
 			t.Errorf("expected %v got %v", test.expectedContainersToDelete, candidates)
 		}

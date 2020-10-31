@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors.
+Copyright 2019 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,49 +17,65 @@ limitations under the License.
 package app
 
 import (
-	"regexp"
 	"testing"
-
-	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 )
 
-func TestLongRunningRequestRegexp(t *testing.T) {
-	regexp := regexp.MustCompile(options.NewAPIServer().LongRunningRequestRE)
-	dontMatch := []string{
-		"/api/v1/watch-namespace/",
-		"/api/v1/namespace-proxy/",
-		"/api/v1/namespace-watch",
-		"/api/v1/namespace-proxy",
-		"/api/v1/namespace-portforward/pods",
-		"/api/v1/portforward/pods",
-		". anything",
-		"/ that",
+func TestGetServiceIPAndRanges(t *testing.T) {
+	tests := []struct {
+		body                    string
+		apiServerServiceIP      string
+		primaryServiceIPRange   string
+		secondaryServiceIPRange string
+		expectedError           bool
+	}{
+		{"", "10.0.0.1", "10.0.0.0/24", "<nil>", false},
+		{"192.0.2.1/24", "192.0.2.1", "192.0.2.0/24", "<nil>", false},
+		{"192.0.2.1/24,192.168.128.0/17", "192.0.2.1", "192.0.2.0/24", "192.168.128.0/17", false},
+		// Dual stack IPv4/IPv6
+		{"192.0.2.1/24,2001:db2:1:3:4::1/112", "192.0.2.1", "192.0.2.0/24", "2001:db2:1:3:4::/112", false},
+		// Dual stack IPv6/IPv4
+		{"2001:db2:1:3:4::1/112,192.0.2.1/24", "2001:db2:1:3:4::1", "2001:db2:1:3:4::/112", "192.0.2.0/24", false},
+
+		{"192.0.2.1/30,192.168.128.0/17", "<nil>", "<nil>", "<nil>", true},
+		// Invalid ip range[0] IPv4 mask
+		{"192.0.2.1/33,192.168.128.0/17", "<nil>", "<nil>", "<nil>", true},
+		// Invalid ip range[1] IPv4 mask
+		{"192.0.2.1/24,192.168.128.0/33", "<nil>", "<nil>", "<nil>", true},
+		// Invalid ip range[0] IPv6 mask
+		{"2001:db2:1:3:4::1/129,192.0.2.1/24", "<nil>", "<nil>", "<nil>", true},
+		// Invalid ip range[1] IPv6 mask
+		{"192.0.2.1/24,2001:db2:1:3:4::1/129", "<nil>", "<nil>", "<nil>", true},
+		// Invalid ip range[0] missing IPv4 mask
+		{"192.0.2.1,192.168.128.0/17", "<nil>", "<nil>", "<nil>", true},
+		// Invalid ip range[1] missing IPv4 mask
+		{"192.0.2.1/24,192.168.128.1", "<nil>", "<nil>", "<nil>", true},
+		// Invalid ip range[0] missing IPv6 mask
+		{"2001:db2:1:3:4::1,192.0.2.1/24", "<nil>", "<nil>", "<nil>", true},
+		// Invalid ip range[1] missing IPv6 mask
+		{"192.0.2.1/24,2001:db2:1:3:4::1", "<nil>", "<nil>", "<nil>", true},
+		// Invalid ip range[0] IP address format
+		{"bad.ip.range,192.168.0.2/24", "<nil>", "<nil>", "<nil>", true},
+		// Invalid ip range[1] IP address format
+		{"192.168.0.2/24,bad.ip.range", "<nil>", "<nil>", "<nil>", true},
 	}
-	doMatch := []string{
-		"/api/v1/pods/watch",
-		"/api/v1/watch/stuff",
-		"/api/v1/default/service/proxy",
-		"/api/v1/pods/proxy/path/to/thing",
-		"/api/v1/namespaces/myns/pods/mypod/log",
-		"/api/v1/namespaces/myns/pods/mypod/logs",
-		"/api/v1/namespaces/myns/pods/mypod/portforward",
-		"/api/v1/namespaces/myns/pods/mypod/exec",
-		"/api/v1/namespaces/myns/pods/mypod/attach",
-		"/api/v1/namespaces/myns/pods/mypod/log/",
-		"/api/v1/namespaces/myns/pods/mypod/logs/",
-		"/api/v1/namespaces/myns/pods/mypod/portforward/",
-		"/api/v1/namespaces/myns/pods/mypod/exec/",
-		"/api/v1/namespaces/myns/pods/mypod/attach/",
-		"/api/v1/watch/namespaces/myns/pods",
-	}
-	for _, path := range dontMatch {
-		if regexp.MatchString(path) {
-			t.Errorf("path should not have match regexp but did: %s", path)
+
+	for _, test := range tests {
+		apiServerServiceIP, primaryServiceIPRange, secondaryServiceIPRange, err := getServiceIPAndRanges(test.body)
+
+		if apiServerServiceIP.String() != test.apiServerServiceIP {
+			t.Errorf("expected apiServerServiceIP: %s, got: %s", test.apiServerServiceIP, apiServerServiceIP.String())
 		}
-	}
-	for _, path := range doMatch {
-		if !regexp.MatchString(path) {
-			t.Errorf("path should have match regexp did not: %s", path)
+
+		if primaryServiceIPRange.String() != test.primaryServiceIPRange {
+			t.Errorf("expected primaryServiceIPRange: %s, got: %s", test.primaryServiceIPRange, primaryServiceIPRange.String())
+		}
+
+		if secondaryServiceIPRange.String() != test.secondaryServiceIPRange {
+			t.Errorf("expected secondaryServiceIPRange: %s, got: %s", test.secondaryServiceIPRange, secondaryServiceIPRange.String())
+		}
+
+		if (err == nil) == test.expectedError {
+			t.Errorf("expected err to be: %t, but it was %t", test.expectedError, !test.expectedError)
 		}
 	}
 }

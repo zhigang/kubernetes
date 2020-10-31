@@ -20,19 +20,21 @@ package custommetrics
 import (
 	"path"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
 )
 
 const (
+	// CustomMetricsDefinitionContainerFile is the file in container that stores Custom Metrics definition
 	CustomMetricsDefinitionContainerFile = "definition.json"
 
+	// CustomMetricsDefinitionDir is the dir where Custom Metrics definition is stored
 	CustomMetricsDefinitionDir = "/etc/custom-metrics"
 )
 
+// GetCAdvisorCustomMetricsDefinitionPath returns a path to a cAdvisor-specific custom metrics configuration.
 // Alpha implementation.
-// Returns a path to a cAdvisor-specific custom metrics configuration.
-func GetCAdvisorCustomMetricsDefinitionPath(container *api.Container) (*string, error) {
-	// Assuemes that the container has Custom Metrics enabled if it has "/etc/custom-metrics" directory
+func GetCAdvisorCustomMetricsDefinitionPath(container *v1.Container) (*string, error) {
+	// Assumes that the container has Custom Metrics enabled if it has "/etc/custom-metrics" directory
 	// mounted as a volume. Custom Metrics definition is expected to be in "definition.json".
 	if container.VolumeMounts != nil {
 		for _, volumeMount := range container.VolumeMounts {

@@ -20,24 +20,24 @@ import (
 	"fmt"
 	"os/exec"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/apimachinery/registered"
-	"k8s.io/kubernetes/pkg/util/uuid"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 
-	. "github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo"
 )
 
 var _ = framework.KubeDescribe("GKE local SSD [Feature:GKELocalSSD]", func() {
 
 	f := framework.NewDefaultFramework("localssd")
 
-	BeforeEach(func() {
-		framework.SkipUnlessProviderIs("gke")
+	ginkgo.BeforeEach(func() {
+		e2eskipper.SkipUnlessProviderIs("gke")
 	})
 
-	It("should write and read from node local SSD [Feature:GKELocalSSD]", func() {
+	ginkgo.It("should write and read from node local SSD [Feature:GKELocalSSD]", func() {
 		framework.Logf("Start local SSD test")
 		createNodePoolWithLocalSsds("np-ssd")
 		doTestWriteAndReadToLocalSsd(f)
@@ -65,28 +65,28 @@ func doTestWriteAndReadToLocalSsd(f *framework.Framework) {
 	f.TestContainerOutput(msg, pod, 0, out)
 }
 
-func testPodWithSsd(command string) *api.Pod {
+func testPodWithSsd(command string) *v1.Pod {
 	containerName := "test-container"
 	volumeName := "test-ssd-volume"
 	path := "/mnt/disks/ssd0"
 	podName := "pod-" + string(uuid.NewUUID())
 	image := "ubuntu:14.04"
-	return &api.Pod{
-		TypeMeta: unversioned.TypeMeta{
+	return &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
 			Kind:       "Pod",
-			APIVersion: registered.GroupOrDie(api.GroupName).GroupVersion.String(),
+			APIVersion: "v1",
 		},
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name: podName,
 		},
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
 					Name:    containerName,
 					Image:   image,
 					Command: []string{"/bin/sh"},
 					Args:    []string{"-c", command},
-					VolumeMounts: []api.VolumeMount{
+					VolumeMounts: []v1.VolumeMount{
 						{
 							Name:      volumeName,
 							MountPath: path,
@@ -94,12 +94,12 @@ func testPodWithSsd(command string) *api.Pod {
 					},
 				},
 			},
-			RestartPolicy: api.RestartPolicyNever,
-			Volumes: []api.Volume{
+			RestartPolicy: v1.RestartPolicyNever,
+			Volumes: []v1.Volume{
 				{
 					Name: volumeName,
-					VolumeSource: api.VolumeSource{
-						HostPath: &api.HostPathVolumeSource{
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
 							Path: path,
 						},
 					},

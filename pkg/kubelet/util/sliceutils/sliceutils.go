@@ -17,10 +17,11 @@ limitations under the License.
 package sliceutils
 
 import (
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 )
 
+// StringInSlice returns true if s is in list
 func StringInSlice(s string, list []string) bool {
 	for _, v := range list {
 		if v == s {
@@ -33,7 +34,7 @@ func StringInSlice(s string, list []string) bool {
 
 // PodsByCreationTime makes an array of pods sortable by their creation
 // timestamps in ascending order.
-type PodsByCreationTime []*api.Pod
+type PodsByCreationTime []*v1.Pod
 
 func (s PodsByCreationTime) Len() int {
 	return len(s)
@@ -44,7 +45,7 @@ func (s PodsByCreationTime) Swap(i, j int) {
 }
 
 func (s PodsByCreationTime) Less(i, j int) bool {
-	return s[i].CreationTimestamp.Before(s[j].CreationTimestamp)
+	return s[i].CreationTimestamp.Before(&s[j].CreationTimestamp)
 }
 
 // ByImageSize makes an array of images sortable by their size in descending
@@ -52,6 +53,9 @@ func (s PodsByCreationTime) Less(i, j int) bool {
 type ByImageSize []kubecontainer.Image
 
 func (a ByImageSize) Less(i, j int) bool {
+	if a[i].Size == a[j].Size {
+		return a[i].ID > a[j].ID
+	}
 	return a[i].Size > a[j].Size
 }
 func (a ByImageSize) Len() int      { return len(a) }

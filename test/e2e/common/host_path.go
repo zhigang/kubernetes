@@ -21,56 +21,65 @@ import (
 	"os"
 	"path"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/apimachinery/registered"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/test/e2e/framework"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 
-	. "github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo"
 )
 
 //TODO : Consolidate this code with the code for emptyDir.
 //This will require some smart.
-var _ = framework.KubeDescribe("HostPath", func() {
+var _ = ginkgo.Describe("[sig-storage] HostPath", func() {
 	f := framework.NewDefaultFramework("hostpath")
 
-	BeforeEach(func() {
+	ginkgo.BeforeEach(func() {
+		// TODO permission denied cleanup failures
 		//cleanup before running the test.
 		_ = os.Remove("/tmp/test-file")
 	})
 
-	It("should give a volume the correct mode [Conformance]", func() {
-		volumePath := "/test-volume"
-		source := &api.HostPathVolumeSource{
+	/*
+	   Host path, volume mode default
+	   Create a Pod with host volume mounted. The volume mounted MUST be a directory with permissions mode -rwxrwxrwx and that is has the sticky bit (mode flag t) set.
+	   This test is marked LinuxOnly since Windows does not support setting the sticky bit (mode flag t).
+	*/
+	ginkgo.It("should give a volume the correct mode [LinuxOnly] [NodeConformance]", func() {
+		source := &v1.HostPathVolumeSource{
 			Path: "/tmp",
 		}
-		pod := testPodWithHostVol(volumePath, source)
+		pod := testPodWithHostVol(volumePath, source, false)
 
 		pod.Spec.Containers[0].Args = []string{
+			"mounttest",
 			fmt.Sprintf("--fs_type=%v", volumePath),
 			fmt.Sprintf("--file_mode=%v", volumePath),
 		}
 		f.TestContainerOutput("hostPath mode", pod, 0, []string{
-			"mode of file \"/test-volume\": dtrwxrwxrwx", // we expect the sticky bit (mode flag t) to be set for the dir
+			"mode of file \"/test-volume\": dtrwxrwx", // we expect the sticky bit (mode flag t) to be set for the dir
 		})
 	})
 
 	// This test requires mounting a folder into a container with write privileges.
-	It("should support r/w", func() {
-		volumePath := "/test-volume"
+	ginkgo.It("should support r/w [NodeConformance]", func() {
 		filePath := path.Join(volumePath, "test-file")
 		retryDuration := 180
-		source := &api.HostPathVolumeSource{
+		source := &v1.HostPathVolumeSource{
 			Path: "/tmp",
 		}
-		pod := testPodWithHostVol(volumePath, source)
+		// we can't spawn privileged containers on Windows, nor do we need to.
+		privileged := !framework.NodeOSDistroIs("windows")
+		pod := testPodWithHostVol(volumePath, source, privileged)
 
 		pod.Spec.Containers[0].Args = []string{
+			"mounttest",
 			fmt.Sprintf("--new_file_0644=%v", filePath),
 			fmt.Sprintf("--file_mode=%v", filePath),
 		}
 
 		pod.Spec.Containers[1].Args = []string{
+			"mounttest",
 			fmt.Sprintf("--file_content_in_loop=%v", filePath),
 			fmt.Sprintf("--retry_time=%d", retryDuration),
 		}
@@ -81,8 +90,7 @@ var _ = framework.KubeDescribe("HostPath", func() {
 		})
 	})
 
-	It("should support subPath [Conformance]", func() {
-		volumePath := "/test-volume"
+	ginkgo.It("should support subPath [NodeConformance]", func() {
 		subPath := "sub-path"
 		fileName := "test-file"
 		retryDuration := 180
@@ -90,19 +98,26 @@ var _ = framework.KubeDescribe("HostPath", func() {
 		filePathInWriter := path.Join(volumePath, fileName)
 		filePathInReader := path.Join(volumePath, subPath, fileName)
 
-		source := &api.HostPathVolumeSource{
+		source := &v1.HostPathVolumeSource{
 			Path: "/tmp",
 		}
-		pod := testPodWithHostVol(volumePath, source)
+
+		// we can't spawn privileged containers on Windows, nor do we need to.
+		privileged := !framework.NodeOSDistroIs("windows")
+		pod := testPodWithHostVol(volumePath, source, privileged)
+
 		// Write the file in the subPath from container 0
 		container := &pod.Spec.Containers[0]
 		container.VolumeMounts[0].SubPath = subPath
 		container.Args = []string{
+			"mounttest",
 			fmt.Sprintf("--new_file_0644=%v", filePathInWriter),
 			fmt.Sprintf("--file_mode=%v", filePathInWriter),
 		}
+
 		// Read it from outside the subPath from container 1
 		pod.Spec.Containers[1].Args = []string{
+			"mounttest",
 			fmt.Sprintf("--file_content_in_loop=%v", filePathInReader),
 			fmt.Sprintf("--retry_time=%d", retryDuration),
 		}
@@ -118,11 +133,11 @@ var _ = framework.KubeDescribe("HostPath", func() {
 const containerName1 = "test-container-1"
 const containerName2 = "test-container-2"
 
-func mount(source *api.HostPathVolumeSource) []api.Volume {
-	return []api.Volume{
+func mount(source *v1.HostPathVolumeSource) []v1.Volume {
+	return []v1.Volume{
 		{
 			Name: volumeName,
-			VolumeSource: api.VolumeSource{
+			VolumeSource: v1.VolumeSource{
 				HostPath: source,
 			},
 		},
@@ -130,41 +145,49 @@ func mount(source *api.HostPathVolumeSource) []api.Volume {
 }
 
 //TODO: To merge this with the emptyDir tests, we can make source a lambda.
-func testPodWithHostVol(path string, source *api.HostPathVolumeSource) *api.Pod {
+func testPodWithHostVol(path string, source *v1.HostPathVolumeSource, privileged bool) *v1.Pod {
 	podName := "pod-host-path-test"
 
-	return &api.Pod{
-		TypeMeta: unversioned.TypeMeta{
+	return &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
 			Kind:       "Pod",
-			APIVersion: registered.GroupOrDie(api.GroupName).GroupVersion.String(),
+			APIVersion: "v1",
 		},
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name: podName,
 		},
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
 					Name:  containerName1,
-					Image: "gcr.io/google_containers/mounttest:0.7",
-					VolumeMounts: []api.VolumeMount{
+					Image: imageutils.GetE2EImage(imageutils.Agnhost),
+					Args:  []string{"mounttest"},
+					VolumeMounts: []v1.VolumeMount{
 						{
 							Name:      volumeName,
 							MountPath: path,
 						},
+					},
+					SecurityContext: &v1.SecurityContext{
+						Privileged: &privileged,
 					},
 				},
 				{
 					Name:  containerName2,
-					Image: "gcr.io/google_containers/mounttest:0.7",
-					VolumeMounts: []api.VolumeMount{
+					Image: imageutils.GetE2EImage(imageutils.Agnhost),
+					Args:  []string{"mounttest"},
+					VolumeMounts: []v1.VolumeMount{
 						{
 							Name:      volumeName,
 							MountPath: path,
 						},
 					},
+					SecurityContext: &v1.SecurityContext{
+						Privileged: &privileged,
+					},
 				},
 			},
-			RestartPolicy: api.RestartPolicyNever,
+			RestartPolicy: v1.RestartPolicyNever,
 			Volumes:       mount(source),
 		},
 	}

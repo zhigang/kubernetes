@@ -25,24 +25,24 @@ type Container struct {
 	ServeMux               *http.ServeMux
 	isRegisteredOnRoot     bool
 	containerFilters       []FilterFunction
-	doNotRecover           bool // default is false
+	doNotRecover           bool // default is true
 	recoverHandleFunc      RecoverHandleFunction
 	serviceErrorHandleFunc ServiceErrorHandleFunction
-	router                 RouteSelector // default is a RouterJSR311, CurlyRouter is the faster alternative
+	router                 RouteSelector // default is a CurlyRouter (RouterJSR311 is a slower alternative)
 	contentEncodingEnabled bool          // default is false
 }
 
-// NewContainer creates a new Container using a new ServeMux and default router (RouterJSR311)
+// NewContainer creates a new Container using a new ServeMux and default router (CurlyRouter)
 func NewContainer() *Container {
 	return &Container{
 		webServices:            []*WebService{},
 		ServeMux:               http.NewServeMux(),
 		isRegisteredOnRoot:     false,
 		containerFilters:       []FilterFunction{},
-		doNotRecover:           false,
+		doNotRecover:           true,
 		recoverHandleFunc:      logStackOnRecover,
 		serviceErrorHandleFunc: writeServiceError,
-		router:                 RouterJSR311{},
+		router:                 CurlyRouter{},
 		contentEncodingEnabled: false}
 }
 
@@ -69,12 +69,12 @@ func (c *Container) ServiceErrorHandler(handler ServiceErrorHandleFunction) {
 
 // DoNotRecover controls whether panics will be caught to return HTTP 500.
 // If set to true, Route functions are responsible for handling any error situation.
-// Default value is false = recover from panics. This has performance implications.
+// Default value is true.
 func (c *Container) DoNotRecover(doNot bool) {
 	c.doNotRecover = doNot
 }
 
-// Router changes the default Router (currently RouterJSR311)
+// Router changes the default Router (currently CurlyRouter)
 func (c *Container) Router(aRouter RouteSelector) {
 	c.router = aRouter
 }
@@ -97,7 +97,7 @@ func (c *Container) Add(service *WebService) *Container {
 	// cannot have duplicate root paths
 	for _, each := range c.webServices {
 		if each.RootPath() == service.RootPath() {
-			log.Printf("[restful] WebService with duplicate root path detected:['%v']", each)
+			log.Printf("WebService with duplicate root path detected:['%v']", each)
 			os.Exit(1)
 		}
 	}
@@ -139,8 +139,8 @@ func (c *Container) addHandler(service *WebService, serveMux *http.ServeMux) boo
 
 func (c *Container) Remove(ws *WebService) error {
 	if c.ServeMux == http.DefaultServeMux {
-		errMsg := fmt.Sprintf("[restful] cannot remove a WebService from a Container using the DefaultServeMux: ['%v']", ws)
-		log.Printf(errMsg)
+		errMsg := fmt.Sprintf("cannot remove a WebService from a Container using the DefaultServeMux: ['%v']", ws)
+		log.Print(errMsg)
 		return errors.New(errMsg)
 	}
 	c.webServicesLock.Lock()
@@ -168,7 +168,7 @@ func (c *Container) Remove(ws *WebService) error {
 // This may be a security issue as it exposes sourcecode information.
 func logStackOnRecover(panicReason interface{}, httpWriter http.ResponseWriter) {
 	var buffer bytes.Buffer
-	buffer.WriteString(fmt.Sprintf("[restful] recover from panic situation: - %v\r\n", panicReason))
+	buffer.WriteString(fmt.Sprintf("recover from panic situation: - %v\r\n", panicReason))
 	for i := 2; ; i += 1 {
 		_, file, line, ok := runtime.Caller(i)
 		if !ok {
@@ -186,6 +186,17 @@ func logStackOnRecover(panicReason interface{}, httpWriter http.ResponseWriter) 
 // calls resp.WriteErrorString(err.Code, err.Message)
 func writeServiceError(err ServiceError, req *Request, resp *Response) {
 	resp.WriteErrorString(err.Code, err.Message)
+}
+
+// Dispatch the incoming Http Request to a matching WebService.
+func (c *Container) Dispatch(httpWriter http.ResponseWriter, httpRequest *http.Request) {
+	if httpWriter == nil {
+		panic("httpWriter cannot be nil")
+	}
+	if httpRequest == nil {
+		panic("httpRequest cannot be nil")
+	}
+	c.dispatch(httpWriter, httpRequest)
 }
 
 // Dispatch the incoming Http Request to a matching WebService.
@@ -208,27 +219,7 @@ func (c *Container) dispatch(httpWriter http.ResponseWriter, httpRequest *http.R
 			}
 		}()
 	}
-	// Install closing the request body (if any)
-	defer func() {
-		if nil != httpRequest.Body {
-			httpRequest.Body.Close()
-		}
-	}()
 
-	// Detect if compression is needed
-	// assume without compression, test for override
-	if c.contentEncodingEnabled {
-		doCompress, encoding := wantsCompressedResponse(httpRequest)
-		if doCompress {
-			var err error
-			writer, err = NewCompressingResponseWriter(httpWriter, encoding)
-			if err != nil {
-				log.Print("[restful] unable to install compressor: ", err)
-				httpWriter.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-		}
-	}
 	// Find best match Route ; err is non nil if no match was found
 	var webService *WebService
 	var route *Route
@@ -240,6 +231,26 @@ func (c *Container) dispatch(httpWriter http.ResponseWriter, httpRequest *http.R
 			c.webServices,
 			httpRequest)
 	}()
+
+	// Detect if compression is needed
+	// assume without compression, test for override
+	contentEncodingEnabled := c.contentEncodingEnabled
+	if route != nil && route.contentEncodingEnabled != nil {
+		contentEncodingEnabled = *route.contentEncodingEnabled
+	}
+	if contentEncodingEnabled {
+		doCompress, encoding := wantsCompressedResponse(httpRequest)
+		if doCompress {
+			var err error
+			writer, err = NewCompressingResponseWriter(httpWriter, encoding)
+			if err != nil {
+				log.Print("unable to install compressor: ", err)
+				httpWriter.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+	}
+
 	if err != nil {
 		// a non-200 response has already been written
 		// run container filters anyway ; they should not touch the response...
@@ -254,7 +265,12 @@ func (c *Container) dispatch(httpWriter http.ResponseWriter, httpRequest *http.R
 		chain.ProcessFilter(NewRequest(httpRequest), NewResponse(writer))
 		return
 	}
-	wrappedRequest, wrappedResponse := route.wrapRequestResponse(writer, httpRequest)
+	pathProcessor, routerProcessesPath := c.router.(PathProcessor)
+	if !routerProcessesPath {
+		pathProcessor = defaultPathProcessor{}
+	}
+	pathParams := pathProcessor.ExtractParameters(route, webService, httpRequest.URL.Path)
+	wrappedRequest, wrappedResponse := route.wrapRequestResponse(writer, httpRequest, pathParams)
 	// pass through filters (if any)
 	if len(c.containerFilters)+len(webService.filters)+len(route.Filters) > 0 {
 		// compose filter chain

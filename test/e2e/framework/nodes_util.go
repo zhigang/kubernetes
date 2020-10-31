@@ -18,215 +18,170 @@ package framework
 
 import (
 	"fmt"
+	"os"
 	"path"
-	"strings"
+	"sync"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/util/wait"
+	"github.com/onsi/ginkgo"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	clientset "k8s.io/client-go/kubernetes"
+
+	// TODO: Remove the following imports (ref: https://github.com/kubernetes/kubernetes/issues/81245)
+	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
+	e2essh "k8s.io/kubernetes/test/e2e/framework/ssh"
 )
 
-// The following upgrade functions are passed into the framework below and used
-// to do the actual upgrades.
-var MasterUpgrade = func(v string) error {
+const etcdImage = "3.4.13-0"
+
+// EtcdUpgrade upgrades etcd on GCE.
+func EtcdUpgrade(targetStorage, targetVersion string) error {
 	switch TestContext.Provider {
 	case "gce":
-		return masterUpgradeGCE(v)
-	case "gke":
-		return masterUpgradeGKE(v)
+		return etcdUpgradeGCE(targetStorage, targetVersion)
 	default:
-		return fmt.Errorf("MasterUpgrade() is not implemented for provider %s", TestContext.Provider)
+		return fmt.Errorf("EtcdUpgrade() is not implemented for provider %s", TestContext.Provider)
 	}
 }
 
-func masterUpgradeGCE(rawV string) error {
-	v := "v" + rawV
-	_, _, err := RunCmd(path.Join(TestContext.RepoRoot, "cluster/gce/upgrade.sh"), "-M", v)
+func etcdUpgradeGCE(targetStorage, targetVersion string) error {
+	env := append(
+		os.Environ(),
+		"TEST_ETCD_VERSION="+targetVersion,
+		"STORAGE_BACKEND="+targetStorage,
+		"TEST_ETCD_IMAGE="+etcdImage)
+
+	_, _, err := RunCmdEnv(env, GCEUpgradeScript(), "-l", "-M")
 	return err
 }
 
-func masterUpgradeGKE(v string) error {
+// LocationParamGKE returns parameter related to location for gcloud command.
+func LocationParamGKE() string {
+	if TestContext.CloudConfig.MultiMaster {
+		// GKE Regional Clusters are being tested.
+		return fmt.Sprintf("--region=%s", TestContext.CloudConfig.Region)
+	}
+	return fmt.Sprintf("--zone=%s", TestContext.CloudConfig.Zone)
+}
+
+// AppendContainerCommandGroupIfNeeded returns container command group parameter if necessary.
+func AppendContainerCommandGroupIfNeeded(args []string) []string {
+	if TestContext.CloudConfig.Region != "" {
+		// TODO(wojtek-t): Get rid of it once Regional Clusters go to GA.
+		return append([]string{"beta"}, args...)
+	}
+	return args
+}
+
+// MasterUpgradeGKE upgrades master node to the specified version on GKE.
+func MasterUpgradeGKE(namespace string, v string) error {
 	Logf("Upgrading master to %q", v)
-	_, _, err := RunCmd("gcloud", "container",
-		"clusters",
-		fmt.Sprintf("--project=%s", TestContext.CloudConfig.ProjectID),
-		fmt.Sprintf("--zone=%s", TestContext.CloudConfig.Zone),
-		"upgrade",
-		TestContext.CloudConfig.Cluster,
-		"--master",
-		fmt.Sprintf("--cluster-version=%s", v),
-		"--quiet")
-	return err
-}
-
-var NodeUpgrade = func(f *Framework, v string, img string) error {
-	// Perform the upgrade.
-	var err error
-	switch TestContext.Provider {
-	case "gce":
-		// TODO(maisem): add GCE support for upgrading to different images.
-		err = nodeUpgradeGCE(v)
-	case "gke":
-		err = nodeUpgradeGKE(v, img)
-	default:
-		err = fmt.Errorf("NodeUpgrade() is not implemented for provider %s", TestContext.Provider)
-	}
-	if err != nil {
-		return err
-	}
-
-	// Wait for it to complete and validate nodes are healthy.
-	//
-	// TODO(ihmccreery) We shouldn't have to wait for nodes to be ready in
-	// GKE; the operation shouldn't return until they all are.
-	Logf("Waiting up to %v for all nodes to be ready after the upgrade", RestartNodeReadyAgainTimeout)
-	if _, err := CheckNodesReady(f.Client, RestartNodeReadyAgainTimeout, TestContext.CloudConfig.NumNodes); err != nil {
-		return err
-	}
-	return nil
-}
-
-func nodeUpgradeGCE(rawV string) error {
-	v := "v" + rawV
-	_, _, err := RunCmd(path.Join(TestContext.RepoRoot, "cluster/gce/upgrade.sh"), "-N", v)
-	return err
-}
-
-func cleanupNodeUpgradeGCE(tmplBefore string) {
-	Logf("Cleaning up any unused node templates")
-	tmplAfter, err := MigTemplate()
-	if err != nil {
-		Logf("Could not get node template post-upgrade; may have leaked template %s", tmplBefore)
-		return
-	}
-	if tmplBefore == tmplAfter {
-		// The node upgrade failed so there's no need to delete
-		// anything.
-		Logf("Node template %s is still in use; not cleaning up", tmplBefore)
-		return
-	}
-	Logf("Deleting node template %s", tmplBefore)
-	if _, _, err := retryCmd("gcloud", "compute", "instance-templates",
-		fmt.Sprintf("--project=%s", TestContext.CloudConfig.ProjectID),
-		"delete",
-		tmplBefore); err != nil {
-		Logf("gcloud compute instance-templates delete %s call failed with err: %v", tmplBefore, err)
-		Logf("May have leaked instance template %q", tmplBefore)
-	}
-}
-
-func nodeUpgradeGKE(v string, img string) error {
-	Logf("Upgrading nodes to version %q and image %q", v, img)
 	args := []string{
 		"container",
 		"clusters",
 		fmt.Sprintf("--project=%s", TestContext.CloudConfig.ProjectID),
-		fmt.Sprintf("--zone=%s", TestContext.CloudConfig.Zone),
+		LocationParamGKE(),
 		"upgrade",
 		TestContext.CloudConfig.Cluster,
+		"--master",
 		fmt.Sprintf("--cluster-version=%s", v),
 		"--quiet",
 	}
-	if len(img) > 0 {
-		args = append(args, fmt.Sprintf("--image-type=%s", img))
+	_, _, err := RunCmd("gcloud", AppendContainerCommandGroupIfNeeded(args)...)
+	if err != nil {
+		return err
 	}
-	_, _, err := RunCmd("gcloud", args...)
-	return err
+
+	WaitForSSHTunnels(namespace)
+
+	return nil
 }
 
-// CheckNodesReady waits up to nt for expect nodes accessed by c to be ready,
-// returning an error if this doesn't happen in time. It returns the names of
-// nodes it finds.
-func CheckNodesReady(c *client.Client, nt time.Duration, expect int) ([]string, error) {
-	// First, keep getting all of the nodes until we get the number we expect.
-	var nodeList *api.NodeList
-	var errLast error
-	start := time.Now()
-	found := wait.Poll(Poll, nt, func() (bool, error) {
-		// A rolling-update (GCE/GKE implementation of restart) can complete before the apiserver
-		// knows about all of the nodes. Thus, we retry the list nodes call
-		// until we get the expected number of nodes.
-		nodeList, errLast = c.Nodes().List(api.ListOptions{
-			FieldSelector: fields.Set{"spec.unschedulable": "false"}.AsSelector()})
-		if errLast != nil {
-			return false, nil
-		}
-		if len(nodeList.Items) != expect {
-			errLast = fmt.Errorf("expected to find %d nodes but found only %d (%v elapsed)",
-				expect, len(nodeList.Items), time.Since(start))
-			Logf("%v", errLast)
-			return false, nil
-		}
-		return true, nil
-	}) == nil
-	nodeNames := make([]string, len(nodeList.Items))
-	for i, n := range nodeList.Items {
-		nodeNames[i] = n.ObjectMeta.Name
+// GCEUpgradeScript returns path of script for upgrading on GCE.
+func GCEUpgradeScript() string {
+	if len(TestContext.GCEUpgradeScript) == 0 {
+		return path.Join(TestContext.RepoRoot, "cluster/gce/upgrade.sh")
 	}
-	if !found {
-		return nodeNames, fmt.Errorf("couldn't find %d nodes within %v; last error: %v",
-			expect, nt, errLast)
-	}
-	Logf("Successfully found %d nodes", expect)
-
-	// Next, ensure in parallel that all the nodes are ready. We subtract the
-	// time we spent waiting above.
-	timeout := nt - time.Since(start)
-	result := make(chan bool, len(nodeList.Items))
-	for _, n := range nodeNames {
-		n := n
-		go func() { result <- WaitForNodeToBeReady(c, n, timeout) }()
-	}
-	failed := false
-	// TODO(mbforbes): Change to `for range` syntax once we support only Go
-	// >= 1.4.
-	for i := range nodeList.Items {
-		_ = i
-		if !<-result {
-			failed = true
-		}
-	}
-	if failed {
-		return nodeNames, fmt.Errorf("at least one node failed to be ready")
-	}
-	return nodeNames, nil
+	return TestContext.GCEUpgradeScript
 }
 
-// MigTemplate (GCE-only) returns the name of the MIG template that the
-// nodes of the cluster use.
-func MigTemplate() (string, error) {
-	var errLast error
-	var templ string
-	key := "instanceTemplate"
-	if wait.Poll(Poll, SingleCallTimeout, func() (bool, error) {
-		// TODO(mikedanese): make this hit the compute API directly instead of
-		// shelling out to gcloud.
-		// An `instance-groups managed describe` call outputs what we want to stdout.
-		output, _, err := retryCmd("gcloud", "compute", "instance-groups", "managed",
-			fmt.Sprintf("--project=%s", TestContext.CloudConfig.ProjectID),
-			"describe",
-			fmt.Sprintf("--zone=%s", TestContext.CloudConfig.Zone),
-			TestContext.CloudConfig.NodeInstanceGroup)
-		if err != nil {
-			errLast = fmt.Errorf("gcloud compute instance-groups managed describe call failed with err: %v", err)
-			return false, nil
-		}
+// WaitForSSHTunnels waits for establishing SSH tunnel to busybox pod.
+func WaitForSSHTunnels(namespace string) {
+	Logf("Waiting for SSH tunnels to establish")
+	RunKubectl(namespace, "run", "ssh-tunnel-test",
+		"--image=busybox",
+		"--restart=Never",
+		"--command", "--",
+		"echo", "Hello")
+	defer RunKubectl(namespace, "delete", "pod", "ssh-tunnel-test")
 
-		// The 'describe' call probably succeeded; parse the output and try to
-		// find the line that looks like "instanceTemplate: url/to/<templ>" and
-		// return <templ>.
-		if val := ParseKVLines(output, key); len(val) > 0 {
-			url := strings.Split(val, "/")
-			templ = url[len(url)-1]
-			Logf("MIG group %s using template: %s", TestContext.CloudConfig.NodeInstanceGroup, templ)
-			return true, nil
-		}
-		errLast = fmt.Errorf("couldn't find %s in output to get MIG template. Output: %s", key, output)
-		return false, nil
-	}) != nil {
-		return "", fmt.Errorf("MigTemplate() failed with last error: %v", errLast)
+	// allow up to a minute for new ssh tunnels to establish
+	wait.PollImmediate(5*time.Second, time.Minute, func() (bool, error) {
+		_, err := RunKubectl(namespace, "logs", "ssh-tunnel-test")
+		return err == nil, nil
+	})
+}
+
+// NodeKiller is a utility to simulate node failures.
+type NodeKiller struct {
+	config   NodeKillerConfig
+	client   clientset.Interface
+	provider string
+}
+
+// NewNodeKiller creates new NodeKiller.
+func NewNodeKiller(config NodeKillerConfig, client clientset.Interface, provider string) *NodeKiller {
+	config.NodeKillerStopCh = make(chan struct{})
+	return &NodeKiller{config, client, provider}
+}
+
+// Run starts NodeKiller until stopCh is closed.
+func (k *NodeKiller) Run(stopCh <-chan struct{}) {
+	// wait.JitterUntil starts work immediately, so wait first.
+	time.Sleep(wait.Jitter(k.config.Interval, k.config.JitterFactor))
+	wait.JitterUntil(func() {
+		nodes := k.pickNodes()
+		k.kill(nodes)
+	}, k.config.Interval, k.config.JitterFactor, true, stopCh)
+}
+
+func (k *NodeKiller) pickNodes() []v1.Node {
+	nodes, err := e2enode.GetReadySchedulableNodes(k.client)
+	ExpectNoError(err)
+	numNodes := int(k.config.FailureRatio * float64(len(nodes.Items)))
+
+	nodes, err = e2enode.GetBoundedReadySchedulableNodes(k.client, numNodes)
+	ExpectNoError(err)
+	return nodes.Items
+}
+
+func (k *NodeKiller) kill(nodes []v1.Node) {
+	wg := sync.WaitGroup{}
+	wg.Add(len(nodes))
+	for _, node := range nodes {
+		node := node
+		go func() {
+			defer ginkgo.GinkgoRecover()
+			defer wg.Done()
+
+			Logf("Stopping docker and kubelet on %q to simulate failure", node.Name)
+			err := e2essh.IssueSSHCommand("sudo systemctl stop docker kubelet", k.provider, &node)
+			if err != nil {
+				Logf("ERROR while stopping node %q: %v", node.Name, err)
+				return
+			}
+
+			time.Sleep(k.config.SimulatedDowntime)
+
+			Logf("Rebooting %q to repair the node", node.Name)
+			err = e2essh.IssueSSHCommand("sudo reboot", k.provider, &node)
+			if err != nil {
+				Logf("ERROR while rebooting node %q: %v", node.Name, err)
+				return
+			}
+		}()
 	}
-	return templ, nil
+	wg.Wait()
 }

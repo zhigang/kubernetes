@@ -16,105 +16,121 @@
 package common
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/google/cadvisor/fs"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 type FsHandler interface {
 	Start()
-	Usage() (baseUsageBytes uint64, totalUsageBytes uint64)
+	Usage() FsUsage
 	Stop()
+}
+
+type FsUsage struct {
+	BaseUsageBytes  uint64
+	TotalUsageBytes uint64
+	InodeUsage      uint64
 }
 
 type realFsHandler struct {
 	sync.RWMutex
-	lastUpdate     time.Time
-	usageBytes     uint64
-	baseUsageBytes uint64
-	period         time.Duration
-	minPeriod      time.Duration
-	rootfs         string
-	extraDir       string
-	fsInfo         fs.FsInfo
+	lastUpdate time.Time
+	usage      FsUsage
+	period     time.Duration
+	minPeriod  time.Duration
+	rootfs     string
+	extraDir   string
+	fsInfo     fs.FsInfo
 	// Tells the container to stop.
 	stopChan chan struct{}
 }
 
 const (
-	longDu             = time.Second
-	duTimeout          = time.Minute
-	maxDuBackoffFactor = 20
+	maxBackoffFactor = 20
 )
+
+const DefaultPeriod = time.Minute
 
 var _ FsHandler = &realFsHandler{}
 
 func NewFsHandler(period time.Duration, rootfs, extraDir string, fsInfo fs.FsInfo) FsHandler {
 	return &realFsHandler{
-		lastUpdate:     time.Time{},
-		usageBytes:     0,
-		baseUsageBytes: 0,
-		period:         period,
-		minPeriod:      period,
-		rootfs:         rootfs,
-		extraDir:       extraDir,
-		fsInfo:         fsInfo,
-		stopChan:       make(chan struct{}, 1),
+		lastUpdate: time.Time{},
+		usage:      FsUsage{},
+		period:     period,
+		minPeriod:  period,
+		rootfs:     rootfs,
+		extraDir:   extraDir,
+		fsInfo:     fsInfo,
+		stopChan:   make(chan struct{}, 1),
 	}
 }
 
 func (fh *realFsHandler) update() error {
 	var (
-		baseUsage, extraDirUsage uint64
-		err                      error
+		rootUsage, extraUsage fs.UsageInfo
+		rootErr, extraErr     error
 	)
 	// TODO(vishh): Add support for external mounts.
 	if fh.rootfs != "" {
-		baseUsage, err = fh.fsInfo.GetDirUsage(fh.rootfs, duTimeout)
-		if err != nil {
-			return err
-		}
+		rootUsage, rootErr = fh.fsInfo.GetDirUsage(fh.rootfs)
 	}
 
 	if fh.extraDir != "" {
-		extraDirUsage, err = fh.fsInfo.GetDirUsage(fh.extraDir, duTimeout)
-		if err != nil {
-			return err
-		}
+		extraUsage, extraErr = fh.fsInfo.GetDirUsage(fh.extraDir)
 	}
 
+	// Wait to handle errors until after all operartions are run.
+	// An error in one will not cause an early return, skipping others
 	fh.Lock()
 	defer fh.Unlock()
 	fh.lastUpdate = time.Now()
-	fh.usageBytes = baseUsage + extraDirUsage
-	fh.baseUsageBytes = baseUsage
+	if fh.rootfs != "" && rootErr == nil {
+		fh.usage.InodeUsage = rootUsage.Inodes
+		fh.usage.BaseUsageBytes = rootUsage.Bytes
+		fh.usage.TotalUsageBytes = rootUsage.Bytes
+	}
+	if fh.extraDir != "" && extraErr == nil {
+		fh.usage.TotalUsageBytes += extraUsage.Bytes
+	}
+
+	// Combine errors into a single error to return
+	if rootErr != nil || extraErr != nil {
+		return fmt.Errorf("rootDiskErr: %v, extraDiskErr: %v", rootErr, extraErr)
+	}
 	return nil
 }
 
 func (fh *realFsHandler) trackUsage() {
-	fh.update()
+	longOp := time.Second
 	for {
+		start := time.Now()
+		if err := fh.update(); err != nil {
+			klog.Errorf("failed to collect filesystem stats - %v", err)
+			fh.period = fh.period * 2
+			if fh.period > maxBackoffFactor*fh.minPeriod {
+				fh.period = maxBackoffFactor * fh.minPeriod
+			}
+		} else {
+			fh.period = fh.minPeriod
+		}
+		duration := time.Since(start)
+		if duration > longOp {
+			// adapt longOp time so that message doesn't continue to print
+			// if the long duration is persistent either because of slow
+			// disk or lots of containers.
+			longOp = longOp + time.Second
+			klog.V(2).Infof("fs: disk usage and inodes count on following dirs took %v: %v; will not log again for this container unless duration exceeds %v", duration, []string{fh.rootfs, fh.extraDir}, longOp)
+		}
 		select {
 		case <-fh.stopChan:
 			return
 		case <-time.After(fh.period):
-			start := time.Now()
-			if err := fh.update(); err != nil {
-				glog.Errorf("failed to collect filesystem stats - %v", err)
-				fh.period = fh.period * 2
-				if fh.period > maxDuBackoffFactor*fh.minPeriod {
-					fh.period = maxDuBackoffFactor * fh.minPeriod
-				}
-			} else {
-				fh.period = fh.minPeriod
-			}
-			duration := time.Since(start)
-			if duration > longDu {
-				glog.V(2).Infof("`du` on following dirs took %v: %v", duration, []string{fh.rootfs, fh.extraDir})
-			}
 		}
 	}
 }
@@ -127,8 +143,8 @@ func (fh *realFsHandler) Stop() {
 	close(fh.stopChan)
 }
 
-func (fh *realFsHandler) Usage() (baseUsageBytes, totalUsageBytes uint64) {
+func (fh *realFsHandler) Usage() FsUsage {
 	fh.RLock()
 	defer fh.RUnlock()
-	return fh.baseUsageBytes, fh.usageBytes
+	return fh.usage
 }

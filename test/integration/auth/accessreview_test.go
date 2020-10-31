@@ -1,5 +1,3 @@
-// +build integration,!no-etcd
-
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -19,22 +17,20 @@ limitations under the License.
 package auth
 
 import (
+	"context"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	authorizationapi "k8s.io/kubernetes/pkg/apis/authorization"
-	"k8s.io/kubernetes/pkg/auth/authenticator"
-	"k8s.io/kubernetes/pkg/auth/authorizer"
-	"k8s.io/kubernetes/pkg/auth/user"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	"k8s.io/kubernetes/pkg/client/restclient"
-	"k8s.io/kubernetes/pkg/master"
-	"k8s.io/kubernetes/plugin/pkg/admission/admit"
+	authorizationapi "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	clientset "k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
@@ -42,37 +38,30 @@ import (
 // TODO(etune): remove this test once a more comprehensive built-in authorizer is implemented.
 type sarAuthorizer struct{}
 
-func (sarAuthorizer) Authorize(a authorizer.Attributes) (bool, string, error) {
+func (sarAuthorizer) Authorize(ctx context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
 	if a.GetUser().GetName() == "dave" {
-		return false, "no", errors.New("I'm sorry, Dave")
+		return authorizer.DecisionNoOpinion, "no", errors.New("I'm sorry, Dave")
 	}
 
-	return true, "you're not dave", nil
+	return authorizer.DecisionAllow, "you're not dave", nil
 }
 
-func alwaysAlice(req *http.Request) (user.Info, bool, error) {
-	return &user.DefaultInfo{
-		Name: "alice",
+func alwaysAlice(req *http.Request) (*authenticator.Response, bool, error) {
+	return &authenticator.Response{
+		User: &user.DefaultInfo{
+			Name: "alice",
+		},
 	}, true, nil
 }
 
 func TestSubjectAccessReview(t *testing.T) {
-	var m *master.Master
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		m.Handler.ServeHTTP(w, req)
-	}))
-	defer s.Close()
-
 	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.Authenticator = authenticator.RequestFunc(alwaysAlice)
-	masterConfig.Authorizer = sarAuthorizer{}
-	masterConfig.AdmissionControl = admit.NewAlwaysAdmit()
-	m, err := master.New(masterConfig)
-	if err != nil {
-		t.Fatalf("error in bringing up the master: %v", err)
-	}
+	masterConfig.GenericConfig.Authentication.Authenticator = authenticator.RequestFunc(alwaysAlice)
+	masterConfig.GenericConfig.Authorization.Authorizer = sarAuthorizer{}
+	_, s, closeFn := framework.RunAMaster(masterConfig)
+	defer closeFn()
 
-	clientset := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
+	clientset := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL})
 
 	tests := []struct {
 		name           string
@@ -134,7 +123,7 @@ func TestSubjectAccessReview(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		response, err := clientset.Authorization().SubjectAccessReviews().Create(test.sar)
+		response, err := clientset.AuthorizationV1().SubjectAccessReviews().Create(context.TODO(), test.sar, metav1.CreateOptions{})
 		switch {
 		case err == nil && len(test.expectedError) == 0:
 
@@ -156,25 +145,18 @@ func TestSubjectAccessReview(t *testing.T) {
 }
 
 func TestSelfSubjectAccessReview(t *testing.T) {
-	var m *master.Master
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		m.Handler.ServeHTTP(w, req)
-	}))
-	defer s.Close()
-
 	username := "alice"
 	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.Authenticator = authenticator.RequestFunc(func(req *http.Request) (user.Info, bool, error) {
-		return &user.DefaultInfo{Name: username}, true, nil
+	masterConfig.GenericConfig.Authentication.Authenticator = authenticator.RequestFunc(func(req *http.Request) (*authenticator.Response, bool, error) {
+		return &authenticator.Response{
+			User: &user.DefaultInfo{Name: username},
+		}, true, nil
 	})
-	masterConfig.Authorizer = sarAuthorizer{}
-	masterConfig.AdmissionControl = admit.NewAlwaysAdmit()
-	m, err := master.New(masterConfig)
-	if err != nil {
-		t.Fatalf("error in bringing up the master: %v", err)
-	}
+	masterConfig.GenericConfig.Authorization.Authorizer = sarAuthorizer{}
+	_, s, closeFn := framework.RunAMaster(masterConfig)
+	defer closeFn()
 
-	clientset := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
+	clientset := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL})
 
 	tests := []struct {
 		name           string
@@ -225,7 +207,7 @@ func TestSelfSubjectAccessReview(t *testing.T) {
 	for _, test := range tests {
 		username = test.username
 
-		response, err := clientset.Authorization().SelfSubjectAccessReviews().Create(test.sar)
+		response, err := clientset.AuthorizationV1().SelfSubjectAccessReviews().Create(context.TODO(), test.sar, metav1.CreateOptions{})
 		switch {
 		case err == nil && len(test.expectedError) == 0:
 
@@ -247,22 +229,13 @@ func TestSelfSubjectAccessReview(t *testing.T) {
 }
 
 func TestLocalSubjectAccessReview(t *testing.T) {
-	var m *master.Master
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		m.Handler.ServeHTTP(w, req)
-	}))
-	defer s.Close()
-
 	masterConfig := framework.NewIntegrationTestMasterConfig()
-	masterConfig.Authenticator = authenticator.RequestFunc(alwaysAlice)
-	masterConfig.Authorizer = sarAuthorizer{}
-	masterConfig.AdmissionControl = admit.NewAlwaysAdmit()
-	m, err := master.New(masterConfig)
-	if err != nil {
-		t.Fatalf("error in bringing up the master: %v", err)
-	}
+	masterConfig.GenericConfig.Authentication.Authenticator = authenticator.RequestFunc(alwaysAlice)
+	masterConfig.GenericConfig.Authorization.Authorizer = sarAuthorizer{}
+	_, s, closeFn := framework.RunAMaster(masterConfig)
+	defer closeFn()
 
-	clientset := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
+	clientset := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL})
 
 	tests := []struct {
 		name           string
@@ -275,7 +248,7 @@ func TestLocalSubjectAccessReview(t *testing.T) {
 			name:      "simple allow",
 			namespace: "foo",
 			sar: &authorizationapi.LocalSubjectAccessReview{
-				ObjectMeta: api.ObjectMeta{Namespace: "foo"},
+				ObjectMeta: metav1.ObjectMeta{Namespace: "foo"},
 				Spec: authorizationapi.SubjectAccessReviewSpec{
 					ResourceAttributes: &authorizationapi.ResourceAttributes{
 						Verb:      "list",
@@ -296,7 +269,7 @@ func TestLocalSubjectAccessReview(t *testing.T) {
 			name:      "simple deny",
 			namespace: "foo",
 			sar: &authorizationapi.LocalSubjectAccessReview{
-				ObjectMeta: api.ObjectMeta{Namespace: "foo"},
+				ObjectMeta: metav1.ObjectMeta{Namespace: "foo"},
 				Spec: authorizationapi.SubjectAccessReviewSpec{
 					ResourceAttributes: &authorizationapi.ResourceAttributes{
 						Verb:      "list",
@@ -318,7 +291,7 @@ func TestLocalSubjectAccessReview(t *testing.T) {
 			name:      "conflicting namespace",
 			namespace: "foo",
 			sar: &authorizationapi.LocalSubjectAccessReview{
-				ObjectMeta: api.ObjectMeta{Namespace: "foo"},
+				ObjectMeta: metav1.ObjectMeta{Namespace: "foo"},
 				Spec: authorizationapi.SubjectAccessReviewSpec{
 					ResourceAttributes: &authorizationapi.ResourceAttributes{
 						Verb:      "list",
@@ -336,7 +309,7 @@ func TestLocalSubjectAccessReview(t *testing.T) {
 			name:      "missing namespace",
 			namespace: "foo",
 			sar: &authorizationapi.LocalSubjectAccessReview{
-				ObjectMeta: api.ObjectMeta{Namespace: "foo"},
+				ObjectMeta: metav1.ObjectMeta{Namespace: "foo"},
 				Spec: authorizationapi.SubjectAccessReviewSpec{
 					ResourceAttributes: &authorizationapi.ResourceAttributes{
 						Verb:     "list",
@@ -352,7 +325,7 @@ func TestLocalSubjectAccessReview(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		response, err := clientset.Authorization().LocalSubjectAccessReviews(test.namespace).Create(test.sar)
+		response, err := clientset.AuthorizationV1().LocalSubjectAccessReviews(test.namespace).Create(context.TODO(), test.sar, metav1.CreateOptions{})
 		switch {
 		case err == nil && len(test.expectedError) == 0:
 
@@ -367,7 +340,7 @@ func TestLocalSubjectAccessReview(t *testing.T) {
 			continue
 		}
 		if response.Status != test.expectedStatus {
-			t.Errorf("%s: expected %v, got %v", test.name, test.expectedStatus, response.Status)
+			t.Errorf("%s: expected %#v, got %#v", test.name, test.expectedStatus, response.Status)
 			continue
 		}
 	}

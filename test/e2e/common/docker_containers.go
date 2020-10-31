@@ -17,71 +17,87 @@ limitations under the License.
 package common
 
 import (
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/util/uuid"
-	"k8s.io/kubernetes/test/e2e/framework"
+	"github.com/onsi/gomega"
 
-	. "github.com/onsi/ginkgo"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/kubernetes/test/e2e/framework"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 )
 
 var _ = framework.KubeDescribe("Docker Containers", func() {
 	f := framework.NewDefaultFramework("containers")
 
-	It("should use the image defaults if command and args are blank [Conformance]", func() {
-		f.TestContainerOutput("use defaults", entrypointTestPod(), 0, []string{
-			"[/ep default arguments]",
-		})
+	/*
+		Release: v1.9
+		Testname: Docker containers, without command and arguments
+		Description: Default command and arguments from the docker image entrypoint MUST be used when Pod does not specify the container command
+	*/
+	framework.ConformanceIt("should use the image defaults if command and args are blank [NodeConformance]", func() {
+		pod := entrypointTestPod(f.Namespace.Name)
+		pod.Spec.Containers[0].Args = nil
+		pod = f.PodClient().Create(pod)
+		err := e2epod.WaitForPodNameRunningInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
+		framework.ExpectNoError(err, "Expected pod %q to be running, got error: %v", pod.Name, err)
+		pollLogs := func() (string, error) {
+			return e2epod.GetPodLogs(f.ClientSet, f.Namespace.Name, pod.Name, pod.Spec.Containers[0].Name)
+		}
+
+		// The agnhost's image default entrypoint / args are: "/agnhost pause"
+		// which will print out "Paused".
+		gomega.Eventually(pollLogs, 3, framework.Poll).Should(gomega.ContainSubstring("Paused"))
 	})
 
-	It("should be able to override the image's default arguments (docker cmd) [Conformance]", func() {
-		pod := entrypointTestPod()
-		pod.Spec.Containers[0].Args = []string{"override", "arguments"}
-
+	/*
+		Release: v1.9
+		Testname: Docker containers, with arguments
+		Description: Default command and  from the docker image entrypoint MUST be used when Pod does not specify the container command but the arguments from Pod spec MUST override when specified.
+	*/
+	framework.ConformanceIt("should be able to override the image's default arguments (docker cmd) [NodeConformance]", func() {
+		pod := entrypointTestPod(f.Namespace.Name, "entrypoint-tester", "override", "arguments")
 		f.TestContainerOutput("override arguments", pod, 0, []string{
-			"[/ep override arguments]",
+			"[/agnhost entrypoint-tester override arguments]",
 		})
 	})
 
 	// Note: when you override the entrypoint, the image's arguments (docker cmd)
 	// are ignored.
-	It("should be able to override the image's default commmand (docker entrypoint) [Conformance]", func() {
-		pod := entrypointTestPod()
-		pod.Spec.Containers[0].Command = []string{"/ep-2"}
+	/*
+		Release: v1.9
+		Testname: Docker containers, with command
+		Description: Default command from the docker image entrypoint MUST NOT be used when Pod specifies the container command.  Command from Pod spec MUST override the command in the image.
+	*/
+	framework.ConformanceIt("should be able to override the image's default command (docker entrypoint) [NodeConformance]", func() {
+		pod := entrypointTestPod(f.Namespace.Name, "entrypoint-tester")
+		pod.Spec.Containers[0].Command = []string{"/agnhost-2"}
 
 		f.TestContainerOutput("override command", pod, 0, []string{
-			"[/ep-2]",
+			"[/agnhost-2 entrypoint-tester]",
 		})
 	})
 
-	It("should be able to override the image's default command and arguments [Conformance]", func() {
-		pod := entrypointTestPod()
-		pod.Spec.Containers[0].Command = []string{"/ep-2"}
-		pod.Spec.Containers[0].Args = []string{"override", "arguments"}
+	/*
+		Release: v1.9
+		Testname: Docker containers, with command and arguments
+		Description: Default command and arguments from the docker image entrypoint MUST NOT be used when Pod specifies the container command and arguments.  Command and arguments from Pod spec MUST override the command and arguments in the image.
+	*/
+	framework.ConformanceIt("should be able to override the image's default command and arguments [NodeConformance]", func() {
+		pod := entrypointTestPod(f.Namespace.Name, "entrypoint-tester", "override", "arguments")
+		pod.Spec.Containers[0].Command = []string{"/agnhost-2"}
 
 		f.TestContainerOutput("override all", pod, 0, []string{
-			"[/ep-2 override arguments]",
+			"[/agnhost-2 entrypoint-tester override arguments]",
 		})
 	})
 })
 
-const testContainerName = "test-container"
-
 // Return a prototypical entrypoint test pod
-func entrypointTestPod() *api.Pod {
+func entrypointTestPod(namespace string, entrypointArgs ...string) *v1.Pod {
 	podName := "client-containers-" + string(uuid.NewUUID())
+	pod := e2epod.NewAgnhostPod(namespace, podName, nil, nil, nil, entrypointArgs...)
 
-	return &api.Pod{
-		ObjectMeta: api.ObjectMeta{
-			Name: podName,
-		},
-		Spec: api.PodSpec{
-			Containers: []api.Container{
-				{
-					Name:  testContainerName,
-					Image: "gcr.io/google_containers/eptest:0.1",
-				},
-			},
-			RestartPolicy: api.RestartPolicyNever,
-		},
-	}
+	one := int64(1)
+	pod.Spec.TerminationGracePeriodSeconds = &one
+	pod.Spec.RestartPolicy = v1.RestartPolicyNever
+	return pod
 }

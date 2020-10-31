@@ -17,17 +17,10 @@ limitations under the License.
 package main
 
 import (
-	"fmt"
-	"os"
-
 	"k8s.io/kubernetes/cmd/kubeadm/app"
+	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
 )
 
-// TODO(phase1+): check for root
 func main() {
-	if err := app.Run(); err != nil {
-		fmt.Printf(app.AlphaWarningOnExit)
-		os.Exit(1)
-	}
-	os.Exit(0)
+	kubeadmutil.CheckErr(app.Run())
 }

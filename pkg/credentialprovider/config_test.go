@@ -17,15 +17,56 @@ limitations under the License.
 package credentialprovider
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
 
+func TestReadDockerConfigFile(t *testing.T) {
+	configJSONFileName := "config.json"
+	var fileInfo *os.File
+
+	//test dockerconfig json
+	inputDockerconfigJSONFile := "{ \"auths\": { \"http://foo.example.com\":{\"auth\":\"Zm9vOmJhcgo=\",\"email\":\"foo@example.com\"}}}"
+
+	preferredPath, err := ioutil.TempDir("", "test_foo_bar_dockerconfigjson_")
+	if err != nil {
+		t.Fatalf("Creating tmp dir fail: %v", err)
+		return
+	}
+	defer os.RemoveAll(preferredPath)
+	absDockerConfigFileLocation, err := filepath.Abs(filepath.Join(preferredPath, configJSONFileName))
+	if err != nil {
+		t.Fatalf("While trying to canonicalize %s: %v", preferredPath, err)
+	}
+
+	if _, err := os.Stat(absDockerConfigFileLocation); os.IsNotExist(err) {
+		//create test cfg file
+		fileInfo, err = os.OpenFile(absDockerConfigFileLocation, os.O_CREATE|os.O_RDWR, 0664)
+		if err != nil {
+			t.Fatalf("While trying to create file %s: %v", absDockerConfigFileLocation, err)
+		}
+		defer fileInfo.Close()
+	}
+
+	fileInfo.WriteString(inputDockerconfigJSONFile)
+
+	orgPreferredPath := GetPreferredDockercfgPath()
+	SetPreferredDockercfgPath(preferredPath)
+	defer SetPreferredDockercfgPath(orgPreferredPath)
+	if _, err := ReadDockerConfigFile(); err != nil {
+		t.Errorf("Getting docker config file fail : %v preferredPath : %q", err, preferredPath)
+	}
+}
 func TestDockerConfigJsonJSONDecode(t *testing.T) {
+	// Fake values for testing.
 	input := []byte(`{"auths": {"http://foo.example.com":{"username": "foo", "password": "bar", "email": "foo@example.com"}, "http://bar.example.com":{"username": "bar", "password": "baz", "email": "bar@example.com"}}}`)
 
-	expect := DockerConfigJson{
+	expect := DockerConfigJSON{
 		Auths: DockerConfig(map[string]DockerConfigEntry{
 			"http://foo.example.com": {
 				Username: "foo",
@@ -40,7 +81,7 @@ func TestDockerConfigJsonJSONDecode(t *testing.T) {
 		}),
 	}
 
-	var output DockerConfigJson
+	var output DockerConfigJSON
 	err := json.Unmarshal(input, &output)
 	if err != nil {
 		t.Errorf("Received unexpected error: %v", err)
@@ -52,6 +93,7 @@ func TestDockerConfigJsonJSONDecode(t *testing.T) {
 }
 
 func TestDockerConfigJSONDecode(t *testing.T) {
+	// Fake values for testing.
 	input := []byte(`{"http://foo.example.com":{"username": "foo", "password": "bar", "email": "foo@example.com"}, "http://bar.example.com":{"username": "bar", "password": "baz", "email": "bar@example.com"}}`)
 
 	expect := DockerConfig(map[string]DockerConfigEntry{
@@ -86,6 +128,7 @@ func TestDockerConfigEntryJSONDecode(t *testing.T) {
 	}{
 		// simple case, just decode the fields
 		{
+			// Fake values for testing.
 			input: []byte(`{"username": "foo", "password": "bar", "email": "foo@example.com"}`),
 			expect: DockerConfigEntry{
 				Username: "foo",
@@ -108,6 +151,7 @@ func TestDockerConfigEntryJSONDecode(t *testing.T) {
 
 		// auth field overrides username & password
 		{
+			// Fake values for testing.
 			input: []byte(`{"username": "foo", "password": "bar", "auth": "cGluZzpwb25n", "email": "foo@example.com"}`),
 			expect: DockerConfigEntry{
 				Username: "ping",
@@ -167,9 +211,50 @@ func TestDecodeDockerConfigFieldAuth(t *testing.T) {
 			password: "bar",
 		},
 
+		// some test as before but with field not well padded
+		{
+			input:    "Zm9vOmJhcg",
+			username: "foo",
+			password: "bar",
+		},
+
+		// some test as before but with new line characters
+		{
+			input:    "Zm9vOm\nJhcg==\n",
+			username: "foo",
+			password: "bar",
+		},
+
+		// standard encoding (with padding)
+		{
+			input:    base64.StdEncoding.EncodeToString([]byte("foo:bar")),
+			username: "foo",
+			password: "bar",
+		},
+
+		// raw encoding (without padding)
+		{
+			input:    base64.RawStdEncoding.EncodeToString([]byte("foo:bar")),
+			username: "foo",
+			password: "bar",
+		},
+
+		// the input is encoded with encodeDockerConfigFieldAuth (standard encoding)
+		{
+			input:    encodeDockerConfigFieldAuth("foo", "bar"),
+			username: "foo",
+			password: "bar",
+		},
+
 		// good base64 data, but no colon separating username & password
 		{
 			input: "cGFudHM=",
+			fail:  true,
+		},
+
+		// only new line characters are ignored
+		{
+			input: "Zm9vOmJhcg== ",
 			fail:  true,
 		},
 
@@ -203,6 +288,7 @@ func TestDockerConfigEntryJSONCompatibleEncode(t *testing.T) {
 	}{
 		// simple case, just decode the fields
 		{
+			// Fake values for testing.
 			expect: []byte(`{"username":"foo","password":"bar","email":"foo@example.com","auth":"Zm9vOmJhcg=="}`),
 			input: DockerConfigEntry{
 				Username: "foo",
@@ -220,6 +306,99 @@ func TestDockerConfigEntryJSONCompatibleEncode(t *testing.T) {
 
 		if string(tt.expect) != string(actual) {
 			t.Errorf("case %d: expected %v, got %v", i, string(tt.expect), string(actual))
+		}
+	}
+}
+
+func TestReadDockerConfigFileFromBytes(t *testing.T) {
+	testCases := []struct {
+		id               string
+		input            []byte
+		expectedCfg      DockerConfig
+		errorExpected    bool
+		expectedErrorMsg string
+	}{
+		{
+			id:    "valid input, no error expected",
+			input: []byte(`{"http://foo.example.com":{"username": "foo", "password": "bar", "email": "foo@example.com"}}`),
+			expectedCfg: DockerConfig(map[string]DockerConfigEntry{
+				"http://foo.example.com": {
+					Username: "foo",
+					Password: "bar",
+					Email:    "foo@example.com",
+				},
+			}),
+		},
+		{
+			id:               "invalid input, error expected",
+			input:            []byte(`{"http://foo.example.com":{"username": "foo", "password": "bar", "email": "foo@example.com"`),
+			errorExpected:    true,
+			expectedErrorMsg: "error occurred while trying to unmarshal json",
+		},
+	}
+
+	for _, tc := range testCases {
+		cfg, err := readDockerConfigFileFromBytes(tc.input)
+		if err != nil && !tc.errorExpected {
+			t.Fatalf("Error was not expected: %v", err)
+		}
+		if err != nil && tc.errorExpected {
+			if !reflect.DeepEqual(err.Error(), tc.expectedErrorMsg) {
+				t.Fatalf("Expected error message: `%s` got `%s`", tc.expectedErrorMsg, err.Error())
+			}
+		} else {
+			if !reflect.DeepEqual(cfg, tc.expectedCfg) {
+				t.Fatalf("expected: %v got %v", tc.expectedCfg, cfg)
+			}
+		}
+	}
+}
+
+func TestReadDockerConfigJSONFileFromBytes(t *testing.T) {
+	testCases := []struct {
+		id               string
+		input            []byte
+		expectedCfg      DockerConfig
+		errorExpected    bool
+		expectedErrorMsg string
+	}{
+		{
+			id:    "valid input, no error expected",
+			input: []byte(`{"auths": {"http://foo.example.com":{"username": "foo", "password": "bar", "email": "foo@example.com"}, "http://bar.example.com":{"username": "bar", "password": "baz", "email": "bar@example.com"}}}`),
+			expectedCfg: DockerConfig(map[string]DockerConfigEntry{
+				"http://foo.example.com": {
+					Username: "foo",
+					Password: "bar",
+					Email:    "foo@example.com",
+				},
+				"http://bar.example.com": {
+					Username: "bar",
+					Password: "baz",
+					Email:    "bar@example.com",
+				},
+			}),
+		},
+		{
+			id:               "invalid input, error expected",
+			input:            []byte(`{"auths": {"http://foo.example.com":{"username": "foo", "password": "bar", "email": "foo@example.com"}, "http://bar.example.com":{"username": "bar", "password": "baz", "email": "bar@example.com"`),
+			errorExpected:    true,
+			expectedErrorMsg: "error occurred while trying to unmarshal json",
+		},
+	}
+
+	for _, tc := range testCases {
+		cfg, err := readDockerConfigJSONFileFromBytes(tc.input)
+		if err != nil && !tc.errorExpected {
+			t.Fatalf("Error was not expected: %v", err)
+		}
+		if err != nil && tc.errorExpected {
+			if !reflect.DeepEqual(err.Error(), tc.expectedErrorMsg) {
+				t.Fatalf("Expected error message: `%s` got `%s`", tc.expectedErrorMsg, err.Error())
+			}
+		} else {
+			if !reflect.DeepEqual(cfg, tc.expectedCfg) {
+				t.Fatalf("expected: %v got %v", tc.expectedCfg, cfg)
+			}
 		}
 	}
 }

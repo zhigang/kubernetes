@@ -17,37 +17,51 @@ limitations under the License.
 package autoprovision
 
 import (
+	"context"
+	"fmt"
 	"io"
 
-	"k8s.io/kubernetes/pkg/client/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-
-	"fmt"
-
-	"k8s.io/kubernetes/pkg/admission"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/controller/informers"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/admission"
+	genericadmissioninitializer "k8s.io/apiserver/pkg/admission/initializer"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
-func init() {
-	admission.RegisterPlugin("NamespaceAutoProvision", func(client clientset.Interface, config io.Reader) (admission.Interface, error) {
-		return NewProvision(client), nil
+// PluginName indicates name of admission plugin.
+const PluginName = "NamespaceAutoProvision"
+
+// Register registers a plugin
+func Register(plugins *admission.Plugins) {
+	plugins.Register(PluginName, func(config io.Reader) (admission.Interface, error) {
+		return NewProvision(), nil
 	})
 }
 
-// provision is an implementation of admission.Interface.
+// Provision is an implementation of admission.Interface.
 // It looks at all incoming requests in a namespace context, and if the namespace does not exist, it creates one.
 // It is useful in deployments that do not want to restrict creation of a namespace prior to its usage.
-type provision struct {
+type Provision struct {
 	*admission.Handler
-	client            clientset.Interface
-	namespaceInformer cache.SharedIndexInformer
+	client          kubernetes.Interface
+	namespaceLister corev1listers.NamespaceLister
 }
 
-var _ = admission.WantsInformerFactory(&provision{})
+var _ admission.MutationInterface = &Provision{}
+var _ = genericadmissioninitializer.WantsExternalKubeInformerFactory(&Provision{})
+var _ = genericadmissioninitializer.WantsExternalKubeClientSet(&Provision{})
 
-func (p *provision) Admit(a admission.Attributes) (err error) {
+// Admit makes an admission decision based on the request attributes
+func (p *Provision) Admit(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
+	// Don't create a namespace if the request is for a dry-run.
+	if a.IsDryRun() {
+		return nil
+	}
+
 	// if we're here, then we've already passed authentication, so we're allowed to do what we're trying to do
 	// if we're here, then the API server has found a route, which means that if we have a non-empty namespace
 	// its a namespaced resource.
@@ -58,43 +72,58 @@ func (p *provision) Admit(a admission.Attributes) (err error) {
 	if !p.WaitForReady() {
 		return admission.NewForbidden(a, fmt.Errorf("not yet ready to handle request"))
 	}
-	namespace := &api.Namespace{
-		ObjectMeta: api.ObjectMeta{
+
+	_, err := p.namespaceLister.Get(a.GetNamespace())
+	if err == nil {
+		return nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return admission.NewForbidden(a, err)
+	}
+
+	namespace := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      a.GetNamespace(),
 			Namespace: "",
 		},
-		Status: api.NamespaceStatus{},
+		Status: corev1.NamespaceStatus{},
 	}
-	_, exists, err := p.namespaceInformer.GetStore().Get(namespace)
-	if err != nil {
-		return admission.NewForbidden(a, err)
-	}
-	if exists {
-		return nil
-	}
-	_, err = p.client.Core().Namespaces().Create(namespace)
+
+	_, err = p.client.CoreV1().Namespaces().Create(context.TODO(), namespace, metav1.CreateOptions{})
 	if err != nil && !errors.IsAlreadyExists(err) {
 		return admission.NewForbidden(a, err)
 	}
+
 	return nil
 }
 
 // NewProvision creates a new namespace provision admission control handler
-func NewProvision(c clientset.Interface) admission.Interface {
-	return &provision{
+func NewProvision() *Provision {
+	return &Provision{
 		Handler: admission.NewHandler(admission.Create),
-		client:  c,
 	}
 }
 
-func (p *provision) SetInformerFactory(f informers.SharedInformerFactory) {
-	p.namespaceInformer = f.Namespaces().Informer()
-	p.SetReadyFunc(p.namespaceInformer.HasSynced)
+// SetExternalKubeClientSet implements the WantsExternalKubeClientSet interface.
+func (p *Provision) SetExternalKubeClientSet(client kubernetes.Interface) {
+	p.client = client
 }
 
-func (p *provision) Validate() error {
-	if p.namespaceInformer == nil {
-		return fmt.Errorf("missing namespaceInformer")
+// SetExternalKubeInformerFactory implements the WantsExternalKubeInformerFactory interface.
+func (p *Provision) SetExternalKubeInformerFactory(f informers.SharedInformerFactory) {
+	namespaceInformer := f.Core().V1().Namespaces()
+	p.namespaceLister = namespaceInformer.Lister()
+	p.SetReadyFunc(namespaceInformer.Informer().HasSynced)
+}
+
+// ValidateInitialization implements the InitializationValidator interface.
+func (p *Provision) ValidateInitialization() error {
+	if p.namespaceLister == nil {
+		return fmt.Errorf("missing namespaceLister")
+	}
+	if p.client == nil {
+		return fmt.Errorf("missing client")
 	}
 	return nil
 }

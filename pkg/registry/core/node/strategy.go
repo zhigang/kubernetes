@@ -17,36 +17,41 @@ limitations under the License.
 package node
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/api/validation"
-	"k8s.io/kubernetes/pkg/fields"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/registry/generic"
+	pkgstorage "k8s.io/apiserver/pkg/storage"
+	"k8s.io/apiserver/pkg/storage/names"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/client"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/master/ports"
-	"k8s.io/kubernetes/pkg/registry/generic"
-	"k8s.io/kubernetes/pkg/runtime"
-	pkgstorage "k8s.io/kubernetes/pkg/storage"
-	utilnet "k8s.io/kubernetes/pkg/util/net"
-	nodeutil "k8s.io/kubernetes/pkg/util/node"
-	"k8s.io/kubernetes/pkg/util/validation/field"
+	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 )
 
 // nodeStrategy implements behavior for nodes
 type nodeStrategy struct {
 	runtime.ObjectTyper
-	api.NameGenerator
+	names.NameGenerator
 }
 
 // Nodes is the default logic that applies when creating and updating Node
 // objects.
-var Strategy = nodeStrategy{api.Scheme, api.SimpleNameGenerator}
+var Strategy = nodeStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
 
 // NamespaceScoped is false for nodes.
 func (nodeStrategy) NamespaceScoped() bool {
@@ -59,20 +64,65 @@ func (nodeStrategy) AllowCreateOnUpdate() bool {
 }
 
 // PrepareForCreate clears fields that are not allowed to be set by end users on creation.
-func (nodeStrategy) PrepareForCreate(ctx api.Context, obj runtime.Object) {
-	_ = obj.(*api.Node)
-	// Nodes allow *all* fields, including status, to be set on create.
+func (nodeStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	node := obj.(*api.Node)
+	dropDisabledFields(node, nil)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (nodeStrategy) PrepareForUpdate(ctx api.Context, obj, old runtime.Object) {
+func (nodeStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newNode := obj.(*api.Node)
 	oldNode := old.(*api.Node)
 	newNode.Status = oldNode.Status
+
+	dropDisabledFields(newNode, oldNode)
+}
+
+func dropDisabledFields(node *api.Node, oldNode *api.Node) {
+	// Nodes allow *all* fields, including status, to be set on create.
+	// for create
+	if !utilfeature.DefaultFeatureGate.Enabled(features.DynamicKubeletConfig) && oldNode == nil {
+		node.Spec.ConfigSource = nil
+		node.Status.Config = nil
+	}
+
+	// for update
+	if !utilfeature.DefaultFeatureGate.Enabled(features.DynamicKubeletConfig) && !nodeConfigSourceInUse(oldNode) && oldNode != nil {
+		node.Spec.ConfigSource = nil
+	}
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack) && !multiNodeCIDRsInUse(oldNode) {
+		if len(node.Spec.PodCIDRs) > 1 {
+			node.Spec.PodCIDRs = node.Spec.PodCIDRs[0:1]
+		}
+	}
+}
+
+// multiNodeCIDRsInUse returns true if Node.Spec.PodCIDRs is greater than one
+func multiNodeCIDRsInUse(node *api.Node) bool {
+	if node == nil {
+		return false
+	}
+
+	if len(node.Spec.PodCIDRs) > 1 {
+		return true
+	}
+	return false
+}
+
+// nodeConfigSourceInUse returns true if node's Spec ConfigSource is set(used)
+func nodeConfigSourceInUse(node *api.Node) bool {
+	if node == nil {
+		return false
+	}
+	if node.Spec.ConfigSource != nil {
+		return true
+	}
+	return false
 }
 
 // Validate validates a new node.
-func (nodeStrategy) Validate(ctx api.Context, obj runtime.Object) field.ErrorList {
+func (nodeStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	node := obj.(*api.Node)
 	return validation.ValidateNode(node)
 }
@@ -82,7 +132,7 @@ func (nodeStrategy) Canonicalize(obj runtime.Object) {
 }
 
 // ValidateUpdate is the default update validation for an end user.
-func (nodeStrategy) ValidateUpdate(ctx api.Context, obj, old runtime.Object) field.ErrorList {
+func (nodeStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	errorList := validation.ValidateNode(obj.(*api.Node))
 	return append(errorList, validation.ValidateNodeUpdate(obj.(*api.Node), old.(*api.Node))...)
 }
@@ -91,7 +141,7 @@ func (nodeStrategy) AllowUnconditionalUpdate() bool {
 	return true
 }
 
-func (ns nodeStrategy) Export(ctx api.Context, obj runtime.Object, exact bool) error {
+func (ns nodeStrategy) Export(ctx context.Context, obj runtime.Object, exact bool) error {
 	n, ok := obj.(*api.Node)
 	if !ok {
 		// unexpected programmer error
@@ -113,18 +163,28 @@ type nodeStatusStrategy struct {
 
 var StatusStrategy = nodeStatusStrategy{Strategy}
 
-func (nodeStatusStrategy) PrepareForCreate(ctx api.Context, obj runtime.Object) {
-	_ = obj.(*api.Node)
-	// Nodes allow *all* fields, including status, to be set on create.
-}
-
-func (nodeStatusStrategy) PrepareForUpdate(ctx api.Context, obj, old runtime.Object) {
+func (nodeStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newNode := obj.(*api.Node)
 	oldNode := old.(*api.Node)
 	newNode.Spec = oldNode.Spec
+
+	if !utilfeature.DefaultFeatureGate.Enabled(features.DynamicKubeletConfig) && !nodeStatusConfigInUse(oldNode) {
+		newNode.Status.Config = nil
+	}
 }
 
-func (nodeStatusStrategy) ValidateUpdate(ctx api.Context, obj, old runtime.Object) field.ErrorList {
+// nodeStatusConfigInUse returns true if node's Status Config is set(used)
+func nodeStatusConfigInUse(node *api.Node) bool {
+	if node == nil {
+		return false
+	}
+	if node.Status.Config != nil {
+		return true
+	}
+	return false
+}
+
+func (nodeStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	return validation.ValidateNodeUpdate(obj.(*api.Node), old.(*api.Node))
 }
 
@@ -134,7 +194,7 @@ func (nodeStatusStrategy) Canonicalize(obj runtime.Object) {
 
 // ResourceGetter is an interface for retrieving resources by ResourceLocation.
 type ResourceGetter interface {
-	Get(api.Context, string) (runtime.Object, error)
+	Get(context.Context, string, *metav1.GetOptions) (runtime.Object, error)
 }
 
 // NodeToSelectableFields returns a field set that represents the object.
@@ -146,68 +206,58 @@ func NodeToSelectableFields(node *api.Node) fields.Set {
 	return generic.MergeFieldsSets(objectMetaFieldsSet, specificFieldsSet)
 }
 
+// GetAttrs returns labels and fields of a given object for filtering purposes.
+func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, error) {
+	nodeObj, ok := obj.(*api.Node)
+	if !ok {
+		return nil, nil, fmt.Errorf("not a node")
+	}
+	return labels.Set(nodeObj.ObjectMeta.Labels), NodeToSelectableFields(nodeObj), nil
+}
+
 // MatchNode returns a generic matcher for a given label and field selector.
 func MatchNode(label labels.Selector, field fields.Selector) pkgstorage.SelectionPredicate {
 	return pkgstorage.SelectionPredicate{
-		Label: label,
-		Field: field,
-		GetAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
-			nodeObj, ok := obj.(*api.Node)
-			if !ok {
-				return nil, nil, fmt.Errorf("not a node")
-			}
-			return labels.Set(nodeObj.ObjectMeta.Labels), NodeToSelectableFields(nodeObj), nil
-		},
+		Label:       label,
+		Field:       field,
+		GetAttrs:    GetAttrs,
 		IndexFields: []string{"metadata.name"},
 	}
 }
 
-func NodeNameTriggerFunc(obj runtime.Object) []pkgstorage.MatchValue {
-	node := obj.(*api.Node)
-	result := pkgstorage.MatchValue{IndexName: "metadata.name", Value: node.ObjectMeta.Name}
-	return []pkgstorage.MatchValue{result}
+// NameTriggerFunc returns value metadata.namespace of given object.
+func NameTriggerFunc(obj runtime.Object) string {
+	return obj.(*api.Node).ObjectMeta.Name
 }
 
-// ResourceLocation returns an URL and transport which one can use to send traffic for the specified node.
-func ResourceLocation(getter ResourceGetter, connection client.ConnectionInfoGetter, proxyTransport http.RoundTripper, ctx api.Context, id string) (*url.URL, http.RoundTripper, error) {
+// ResourceLocation returns a URL and transport which one can use to send traffic for the specified node.
+func ResourceLocation(getter ResourceGetter, connection client.ConnectionInfoGetter, proxyTransport http.RoundTripper, ctx context.Context, id string) (*url.URL, http.RoundTripper, error) {
 	schemeReq, name, portReq, valid := utilnet.SplitSchemeNamePort(id)
 	if !valid {
 		return nil, nil, errors.NewBadRequest(fmt.Sprintf("invalid node request %q", id))
 	}
 
-	nodeObj, err := getter.Get(ctx, name)
+	info, err := connection.GetConnectionInfo(ctx, types.NodeName(name))
 	if err != nil {
 		return nil, nil, err
 	}
-	node := nodeObj.(*api.Node)
-	hostIP, err := nodeutil.GetNodeHostIP(node)
-	if err != nil {
-		return nil, nil, err
-	}
-	host := hostIP.String()
 
 	// We check if we want to get a default Kubelet's transport. It happens if either:
-	// - no port is specified in request (Kubelet's port is default),
-	// - we're using Port stored as a DaemonEndpoint and requested port is a Kubelet's port stored in the DaemonEndpoint,
-	// - there's no information in the API about DaemonEnpoint (legacy cluster) and requested port is equal to ports.KubeletPort (cluster-wide config)
-	kubeletPort := node.Status.DaemonEndpoints.KubeletEndpoint.Port
-	if kubeletPort == 0 {
-		kubeletPort = ports.KubeletPort
-	}
-	if portReq == "" || strconv.Itoa(int(kubeletPort)) == portReq {
-		scheme, port, kubeletTransport, err := connection.GetConnectionInfo(ctx, node.Name)
-		if err != nil {
-			return nil, nil, err
-		}
+	// - no port is specified in request (Kubelet's port is default)
+	// - the requested port matches the kubelet port for this node
+	if portReq == "" || portReq == info.Port {
 		return &url.URL{
-				Scheme: scheme,
-				Host: net.JoinHostPort(
-					host,
-					strconv.FormatUint(uint64(port), 10),
-				),
+				Scheme: info.Scheme,
+				Host:   net.JoinHostPort(info.Hostname, info.Port),
 			},
-			kubeletTransport,
+			info.Transport,
 			nil
 	}
-	return &url.URL{Scheme: schemeReq, Host: net.JoinHostPort(host, portReq)}, proxyTransport, nil
+
+	if err := proxyutil.IsProxyableHostname(ctx, &net.Resolver{}, info.Hostname); err != nil {
+		return nil, nil, errors.NewBadRequest(err.Error())
+	}
+
+	// Otherwise, return the requested scheme and port, and the proxy transport
+	return &url.URL{Scheme: schemeReq, Host: net.JoinHostPort(info.Hostname, portReq)}, proxyTransport, nil
 }

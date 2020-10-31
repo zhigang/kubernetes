@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -23,74 +23,21 @@ set -o pipefail
 # echo "NOTE:"
 # echo "kubectl.sh is deprecated and will be removed soon."
 # echo "please replace all usage with calls to the kubectl"
-# echo "binary and ensure that it is in your PATH." 
+# echo "binary and ensure that it is in your PATH."
 # echo ""
 # echo "Please see 'kubectl help config' for more details"
 # echo "about configuring kubectl for your cluster."
 # echo "-=-=-=-=-=-=-=-=-=-="
 
 
-KUBE_ROOT=${KUBE_ROOT:-$(dirname "${BASH_SOURCE}")/..}
+KUBE_ROOT=${KUBE_ROOT:-$(dirname "${BASH_SOURCE[0]}")/..}
 source "${KUBE_ROOT}/cluster/kube-util.sh"
-
-# Get the absolute path of the directory component of a file, i.e. the
-# absolute path of the dirname of $1.
-get_absolute_dirname() {
-  echo "$(cd "$(dirname "$1")" && pwd)"
-}
-
-# Detect the OS name/arch so that we can find our binary
-case "$(uname -s)" in
-  Darwin)
-    host_os=darwin
-    ;;
-  Linux)
-    host_os=linux
-    ;;
-  *)
-    echo "Unsupported host OS.  Must be Linux or Mac OS X." >&2
-    exit 1
-    ;;
-esac
-
-case "$(uname -m)" in
-  x86_64*)
-    host_arch=amd64
-    ;;
-  i?86_64*)
-    host_arch=amd64
-    ;;
-  amd64*)
-    host_arch=amd64
-    ;;
-  arm*)
-    host_arch=arm
-    ;;
-  i?86*)
-    host_arch=386
-    ;;
-  s390x*)
-    host_arch=s390x
-    ;;
-  ppc64le*)
-    host_arch=ppc64le
-    ;;
-  *)
-    echo "Unsupported host arch. Must be x86_64, 386, arm, s390x or ppc64le." >&2
-    exit 1
-    ;;
-esac
+source "${KUBE_ROOT}/hack/lib/util.sh"
 
 # If KUBECTL_PATH isn't set, gather up the list of likely places and use ls
 # to find the latest one.
 if [[ -z "${KUBECTL_PATH:-}" ]]; then
-  locations=(
-    "${KUBE_ROOT}/_output/bin/kubectl"
-    "${KUBE_ROOT}/_output/dockerized/bin/${host_os}/${host_arch}/kubectl"
-    "${KUBE_ROOT}/_output/local/bin/${host_os}/${host_arch}/kubectl"
-    "${KUBE_ROOT}/platforms/${host_os}/${host_arch}/kubectl"
-  )
-  kubectl=$( (ls -t "${locations[@]}" 2>/dev/null || true) | head -1 )
+  kubectl=$( kube::util::find-binary "kubectl" )
 
   if [[ ! -x "$kubectl" ]]; then
     {
@@ -131,4 +78,10 @@ if false; then
   echo "Running:" "${kubectl}" "${config[@]:+${config[@]}}" "${@+$@}" >&2
 fi
 
+if [[ "${1:-}" =~ ^(path)$ ]]; then
+  echo "${kubectl}"
+  exit 0
+fi
+
 "${kubectl}" "${config[@]:+${config[@]}}" "${@+$@}"
+

@@ -17,138 +17,192 @@ limitations under the License.
 package kubemark
 
 import (
+	"fmt"
 	"time"
 
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
+	internalapi "k8s.io/cri-api/pkg/apis"
 	kubeletapp "k8s.io/kubernetes/cmd/kubelet/app"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/apis/componentconfig"
-	"k8s.io/kubernetes/pkg/apis/componentconfig/v1alpha1"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	"k8s.io/kubernetes/cmd/kubelet/app/options"
+	"k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/kubelet"
+	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
-	"k8s.io/kubernetes/pkg/kubelet/dockertools"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	kubeio "k8s.io/kubernetes/pkg/util/io"
-	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/util/oom"
-	"k8s.io/kubernetes/pkg/volume/empty_dir"
+	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/kubernetes/pkg/volume/cephfs"
+	"k8s.io/kubernetes/pkg/volume/configmap"
+	"k8s.io/kubernetes/pkg/volume/csi"
+	"k8s.io/kubernetes/pkg/volume/downwardapi"
+	"k8s.io/kubernetes/pkg/volume/emptydir"
+	"k8s.io/kubernetes/pkg/volume/fc"
+	"k8s.io/kubernetes/pkg/volume/flocker"
+	"k8s.io/kubernetes/pkg/volume/git_repo"
+	"k8s.io/kubernetes/pkg/volume/glusterfs"
+	"k8s.io/kubernetes/pkg/volume/hostpath"
+	"k8s.io/kubernetes/pkg/volume/iscsi"
+	"k8s.io/kubernetes/pkg/volume/local"
+	"k8s.io/kubernetes/pkg/volume/nfs"
+	"k8s.io/kubernetes/pkg/volume/portworx"
+	"k8s.io/kubernetes/pkg/volume/projected"
+	"k8s.io/kubernetes/pkg/volume/quobyte"
+	"k8s.io/kubernetes/pkg/volume/rbd"
+	"k8s.io/kubernetes/pkg/volume/scaleio"
+	"k8s.io/kubernetes/pkg/volume/secret"
+	"k8s.io/kubernetes/pkg/volume/storageos"
+	"k8s.io/kubernetes/pkg/volume/util/hostutil"
+	"k8s.io/kubernetes/pkg/volume/util/subpath"
 	"k8s.io/kubernetes/test/utils"
-
-	"github.com/golang/glog"
 )
 
 type HollowKubelet struct {
-	KubeletConfiguration *componentconfig.KubeletConfiguration
-	KubeletDeps          *kubelet.KubeletDeps
+	KubeletFlags         *options.KubeletFlags
+	KubeletConfiguration *kubeletconfig.KubeletConfiguration
+	KubeletDeps          *kubelet.Dependencies
+}
+
+func volumePlugins() []volume.VolumePlugin {
+	allPlugins := []volume.VolumePlugin{}
+	allPlugins = append(allPlugins, emptydir.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, git_repo.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, hostpath.ProbeVolumePlugins(volume.VolumeConfig{})...)
+	allPlugins = append(allPlugins, nfs.ProbeVolumePlugins(volume.VolumeConfig{})...)
+	allPlugins = append(allPlugins, secret.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, iscsi.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, glusterfs.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, rbd.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, quobyte.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, cephfs.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, downwardapi.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, fc.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, flocker.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, configmap.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, projected.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, portworx.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, scaleio.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, local.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, storageos.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, csi.ProbeVolumePlugins()...)
+	return allPlugins
 }
 
 func NewHollowKubelet(
-	nodeName string,
+	flags *options.KubeletFlags,
+	config *kubeletconfig.KubeletConfiguration,
 	client *clientset.Clientset,
+	heartbeatClient *clientset.Clientset,
 	cadvisorInterface cadvisor.Interface,
-	dockerClient dockertools.DockerInterface,
-	kubeletPort, kubeletReadOnlyPort int,
-	containerManager cm.ContainerManager,
-	maxPods int, podsPerCore int,
-) *HollowKubelet {
-	// -----------------
-	// Static config
-	// -----------------
-	c := GetHollowKubeletConfig(nodeName, kubeletPort, kubeletReadOnlyPort, maxPods, podsPerCore)
-
-	// -----------------
-	// Injected objects
-	// -----------------
-	d := &kubelet.KubeletDeps{
-		KubeClient:        client,
-		DockerClient:      dockerClient,
-		CAdvisorInterface: cadvisorInterface,
-		Cloud:             nil,
-		OSInterface:       &containertest.FakeOS{},
-		ContainerManager:  containerManager,
-		VolumePlugins:     empty_dir.ProbeVolumePlugins(),
-		TLSOptions:        nil,
-		OOMAdjuster:       oom.NewFakeOOMAdjuster(),
-		Writer:            &kubeio.StdWriter{},
-		Mounter:           mount.New(),
+	imageService internalapi.ImageManagerService,
+	runtimeService internalapi.RuntimeService,
+	containerManager cm.ContainerManager) *HollowKubelet {
+	d := &kubelet.Dependencies{
+		KubeClient:           client,
+		HeartbeatClient:      heartbeatClient,
+		RemoteRuntimeService: runtimeService,
+		RemoteImageService:   imageService,
+		CAdvisorInterface:    cadvisorInterface,
+		Cloud:                nil,
+		OSInterface:          &containertest.FakeOS{},
+		ContainerManager:     containerManager,
+		VolumePlugins:        volumePlugins(),
+		TLSOptions:           nil,
+		OOMAdjuster:          oom.NewFakeOOMAdjuster(),
+		Mounter:              &mount.FakeMounter{},
+		Subpather:            &subpath.FakeSubpath{},
+		HostUtil:             hostutil.NewFakeHostUtil(nil),
 	}
 
 	return &HollowKubelet{
-		KubeletConfiguration: c,
+		KubeletFlags:         flags,
+		KubeletConfiguration: config,
 		KubeletDeps:          d,
 	}
 }
 
 // Starts this HollowKubelet and blocks.
 func (hk *HollowKubelet) Run() {
-	kubeletapp.RunKubelet(hk.KubeletConfiguration, hk.KubeletDeps, false, false)
+	if err := kubeletapp.RunKubelet(&options.KubeletServer{
+		KubeletFlags:         *hk.KubeletFlags,
+		KubeletConfiguration: *hk.KubeletConfiguration,
+	}, hk.KubeletDeps, false); err != nil {
+		klog.Fatalf("Failed to run HollowKubelet: %v. Exiting.", err)
+	}
 	select {}
+}
+
+// HollowKubletOptions contains settable parameters for hollow kubelet.
+type HollowKubletOptions struct {
+	NodeName            string
+	KubeletPort         int
+	KubeletReadOnlyPort int
+	MaxPods             int
+	PodsPerCore         int
+	NodeLabels          map[string]string
+	RegisterWithTaints  []core.Taint
 }
 
 // Builds a KubeletConfiguration for the HollowKubelet, ensuring that the
 // usual defaults are applied for fields we do not override.
-func GetHollowKubeletConfig(
-	nodeName string,
-	kubeletPort int,
-	kubeletReadOnlyPort int,
-	maxPods int,
-	podsPerCore int) *componentconfig.KubeletConfiguration {
-
+func GetHollowKubeletConfig(opt *HollowKubletOptions) (*options.KubeletFlags, *kubeletconfig.KubeletConfiguration) {
 	testRootDir := utils.MakeTempDirOrDie("hollow-kubelet.", "")
-	manifestFilePath := utils.MakeTempDirOrDie("manifest", testRootDir)
-	glog.Infof("Using %s as root dir for hollow-kubelet", testRootDir)
+	podFilePath := utils.MakeTempDirOrDie("static-pods", testRootDir)
+	klog.Infof("Using %s as root dir for hollow-kubelet", testRootDir)
 
-	// Do the external -> internal conversion to make sure that defaults
-	// are set for fields not overridden in NewHollowKubelet.
-	tmp := &v1alpha1.KubeletConfiguration{}
-	c := &componentconfig.KubeletConfiguration{}
-	api.Scheme.Convert(tmp, c, nil)
+	// Flags struct
+	f := options.NewKubeletFlags()
+	f.RootDirectory = testRootDir
+	f.HostnameOverride = opt.NodeName
+	f.MinimumGCAge = metav1.Duration{Duration: 1 * time.Minute}
+	f.MaxContainerCount = 100
+	f.MaxPerPodContainerCount = 2
+	f.NodeLabels = opt.NodeLabels
+	f.ContainerRuntimeOptions.ContainerRuntime = kubetypes.RemoteContainerRuntime
+	f.RegisterNode = true
+	f.RegisterSchedulable = true
+	f.RegisterWithTaints = opt.RegisterWithTaints
 
-	c.HostnameOverride = nodeName
-	c.RootDirectory = testRootDir
-	c.ManifestURL = ""
+	// Config struct
+	c, err := options.NewKubeletConfiguration()
+	if err != nil {
+		panic(err)
+	}
+
+	c.StaticPodURL = ""
+	c.EnableServer = true
 	c.Address = "0.0.0.0" /* bind address */
-	c.Port = int32(kubeletPort)
-	c.ReadOnlyPort = int32(kubeletReadOnlyPort)
-	c.MasterServiceNamespace = api.NamespaceDefault
-	c.PodManifestPath = manifestFilePath
+	c.Port = int32(opt.KubeletPort)
+	c.ReadOnlyPort = int32(opt.KubeletReadOnlyPort)
+	c.StaticPodPath = podFilePath
 	c.FileCheckFrequency.Duration = 20 * time.Second
 	c.HTTPCheckFrequency.Duration = 20 * time.Second
-	c.MinimumGCAge.Duration = 1 * time.Minute
 	c.NodeStatusUpdateFrequency.Duration = 10 * time.Second
+	c.NodeStatusReportFrequency.Duration = 5 * time.Minute
 	c.SyncFrequency.Duration = 10 * time.Second
-	c.OutOfDiskTransitionFrequency.Duration = 5 * time.Minute
 	c.EvictionPressureTransitionPeriod.Duration = 5 * time.Minute
-	c.MaxPods = int32(maxPods)
-	c.PodsPerCore = int32(podsPerCore)
-	c.ClusterDNS = ""
-	c.DockerExecHandlerName = "native"
+	c.MaxPods = int32(opt.MaxPods)
+	c.PodsPerCore = int32(opt.PodsPerCore)
+	c.ClusterDNS = []string{}
 	c.ImageGCHighThresholdPercent = 90
 	c.ImageGCLowThresholdPercent = 80
-	c.LowDiskSpaceThresholdMB = 256
+	c.ProviderID = fmt.Sprintf("kubemark://%v", opt.NodeName)
 	c.VolumeStatsAggPeriod.Duration = time.Minute
 	c.CgroupRoot = ""
-	c.ContainerRuntime = "docker"
 	c.CPUCFSQuota = true
-	c.RuntimeCgroups = ""
 	c.EnableControllerAttachDetach = false
-	c.EnableCustomMetrics = false
 	c.EnableDebuggingHandlers = true
-	c.EnableServer = true
 	c.CgroupsPerQOS = false
-	// Since this kubelet runs with --configure-cbr0=false, it needs to use
-	// hairpin-veth to allow hairpin packets. Note that this deviates from
+	// hairpin-veth is used to allow hairpin packets. Note that this deviates from
 	// what the "real" kubelet currently does, because there's no way to
 	// set promiscuous mode on docker0.
-	c.HairpinMode = componentconfig.HairpinVeth
-	c.MaxContainerCount = 100
+	c.HairpinMode = kubeletconfig.HairpinVeth
 	c.MaxOpenFiles = 1024
-	c.MaxPerPodContainerCount = 2
-	c.NvidiaGPUs = 0
-	c.RegisterNode = true
-	c.RegisterSchedulable = true
 	c.RegistryBurst = 10
 	c.RegistryPullQPS = 5.0
 	c.ResolverConfig = kubetypes.ResolvConfDefault
@@ -157,12 +211,5 @@ func GetHollowKubeletConfig(
 	c.SystemCgroups = ""
 	c.ProtectKernelDefaults = false
 
-	// TODO(mtaufen): Note that PodInfraContainerImage was being set to the empty value before,
-	//                but this may not have been intentional. (previous code (SimpleKubelet)
-	//                was peeling it off of a componentconfig.KubeletConfiguration{}, but may
-	//                have actually wanted the default).
-	//                The default will be present in the KubeletConfiguration contstructed above.
-
-	return c
-
+	return f, c
 }

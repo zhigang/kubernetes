@@ -16,6 +16,8 @@ limitations under the License.
 
 package types
 
+import "strings"
+
 // Ref makes a reference to the given type. It can only be used for e.g.
 // passing to namers.
 func Ref(packageName, typeName string) *Type {
@@ -42,6 +44,19 @@ func (n Name) String() string {
 		return n.Name
 	}
 	return n.Package + "." + n.Name
+}
+
+// ParseFullyQualifiedName parses a name like k8s.io/kubernetes/pkg/api.Pod into a Name.
+func ParseFullyQualifiedName(fqn string) Name {
+	cs := strings.Split(fqn, ".")
+	pkg := ""
+	if len(cs) > 1 {
+		pkg = strings.Join(cs[0:len(cs)-1], ".")
+	}
+	return Name{
+		Name:    cs[len(cs)-1],
+		Package: pkg,
+	}
 }
 
 // The possible classes of types.
@@ -94,14 +109,18 @@ type Package struct {
 	// Canonical name of this package-- its path.
 	Path string
 
+	// The location this package was loaded from
+	SourcePath string
+
 	// Short name of this package; the name that appears in the
 	// 'package x' line.
 	Name string
 
-	// DocComments from doc.go, if any.
+	// The comment right above the package declaration in doc.go, if any.
 	DocComments []string
 
-	// Comments from doc.go, if any.
+	// All comments from doc.go, if any.
+	// TODO: remove Comments and use DocComments everywhere.
 	Comments []string
 
 	// Types within this package, indexed by their name (*not* including
@@ -115,6 +134,10 @@ type Package struct {
 	// Global variables within this package, indexed by their name (*not* including
 	// package name).
 	Variables map[string]*Type
+
+	// Global constants within this package, indexed by their name (*not* including
+	// package name).
+	Constants map[string]*Type
 
 	// Packages imported by this package, indexed by (canonicalized)
 	// package path.
@@ -160,7 +183,7 @@ func (p *Package) Function(funcName string) *Type {
 	return t
 }
 
-// Variable gets the given varaible Type in this Package. If the variable is
+// Variable gets the given variable Type in this Package. If the variable is
 // not already defined, this will add it. If a variable is added, it's the caller's
 // responsibility to finish construction of the variable by setting Underlying
 // to the correct type.
@@ -171,6 +194,20 @@ func (p *Package) Variable(varName string) *Type {
 	t := &Type{Name: Name{Package: p.Path, Name: varName}}
 	t.Kind = DeclarationOf
 	p.Variables[varName] = t
+	return t
+}
+
+// Constant gets the given constant Type in this Package. If the constant is
+// not already defined, this will add it. If a constant is added, it's the caller's
+// responsibility to finish construction of the constant by setting Underlying
+// to the correct type.
+func (p *Package) Constant(constName string) *Type {
+	if t, ok := p.Constants[constName]; ok {
+		return t
+	}
+	t := &Type{Name: Name{Package: p.Path, Name: constName}}
+	t.Kind = DeclarationOf
+	p.Constants[constName] = t
 	return t
 }
 
@@ -210,6 +247,14 @@ func (u Universe) Variable(n Name) *Type {
 	return u.Package(n.Package).Variable(n.Name)
 }
 
+// Constant returns the canonical constant for the given fully-qualified name.
+// If a non-existing constant is requested, this will create (a marker for) it.
+// If a marker is created, it's the caller's responsibility to finish
+// construction of the constant by setting Underlying to the correct type.
+func (u Universe) Constant(n Name) *Type {
+	return u.Package(n.Package).Constant(n.Name)
+}
+
 // AddImports registers import lines for packageName. May be called multiple times.
 // You are responsible for canonicalizing all package paths.
 func (u Universe) AddImports(packagePath string, importPaths ...string) {
@@ -232,6 +277,7 @@ func (u Universe) Package(packagePath string) *Package {
 		Types:     map[string]*Type{},
 		Functions: map[string]*Type{},
 		Variables: map[string]*Type{},
+		Constants: map[string]*Type{},
 		Imports:   map[string]*Package{},
 	}
 	u[packagePath] = p

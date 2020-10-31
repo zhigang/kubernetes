@@ -1,3 +1,10 @@
-assignees:
-  - erictune
-  - liggitt
+# See the OWNERS docs at https://go.k8s.io/owners
+
+approvers:
+- erictune
+- liggitt
+- deads2k
+- mikedanese
+reviewers:
+- mikedanese
+- enj

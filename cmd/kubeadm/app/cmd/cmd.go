@@ -19,72 +19,82 @@ package cmd
 import (
 	"io"
 
-	"github.com/renstrom/dedent"
+	"github.com/lithammer/dedent"
 	"github.com/spf13/cobra"
-
-	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/api"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/util/flag"
+	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/alpha"
+	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
+	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/upgrade"
+	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
+	// Register the kubeadm configuration types because CLI flag generation
+	// depends on the generated defaults.
 )
 
-func NewKubeadmCommand(f *cmdutil.Factory, in io.Reader, out, err io.Writer, envParams map[string]string) *cobra.Command {
+// NewKubeadmCommand returns cobra.Command to run kubeadm command
+func NewKubeadmCommand(in io.Reader, out, err io.Writer) *cobra.Command {
+	var rootfsPath string
+
 	cmds := &cobra.Command{
 		Use:   "kubeadm",
-		Short: "kubeadm: easily bootstrap a secure Kubernetes cluster.",
+		Short: "kubeadm: easily bootstrap a secure Kubernetes cluster",
 		Long: dedent.Dedent(`
-			kubeadm: easily bootstrap a secure Kubernetes cluster.
 
 			    ┌──────────────────────────────────────────────────────────┐
-			    │ KUBEADM IS ALPHA, DO NOT USE IT FOR PRODUCTION CLUSTERS! │
+			    │ KUBEADM                                                  │
+			    │ Easily bootstrap a secure Kubernetes cluster             │
 			    │                                                          │
-			    │ But, please try it out! Give us feedback at:             │
-			    │ https://github.com/kubernetes/kubernetes/issues          │
-			    │ and at-mention @kubernetes/sig-cluster-lifecycle         │
+			    │ Please give us feedback at:                              │
+			    │ https://github.com/kubernetes/kubeadm/issues             │
 			    └──────────────────────────────────────────────────────────┘
 
 			Example usage:
 
-			    Create a two-machine cluster with one master (which controls the cluster),
-			    and one node (where workloads, like pods and replica sets run).
+			    Create a two-machine cluster with one control-plane node
+			    (which controls the cluster), and one worker node
+			    (where your workloads, like Pods and Deployments run).
 
 			    ┌──────────────────────────────────────────────────────────┐
-			    │  On the first machine                                    │
+			    │ On the first machine:                                    │
 			    ├──────────────────────────────────────────────────────────┤
-			    │ master# kubeadm init                                     │
+			    │ control-plane# kubeadm init                              │
 			    └──────────────────────────────────────────────────────────┘
 
 			    ┌──────────────────────────────────────────────────────────┐
-			    │ On the second machine                                    │
+			    │ On the second machine:                                   │
 			    ├──────────────────────────────────────────────────────────┤
-			    │ node# kubeadm join --token=<token> <ip-of-master>        │
+			    │ worker# kubeadm join <arguments-returned-from-init>      │
 			    └──────────────────────────────────────────────────────────┘
 
 			    You can then repeat the second step on as many other machines as you like.
 
 		`),
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if rootfsPath != "" {
+				if err := kubeadmutil.Chroot(rootfsPath); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
 	}
-	// TODO(phase2+) figure out how to avoid running as root
-	//
-	// TODO(phase2) detect interactive vs non-interactive use and adjust output accordingly
-	// i.e. make it automation friendly
-	//
-	// TODO(phase2) create an abstraction that defines files and the content that needs to
-	// be written to disc and write it all in one go at the end as we have a lot of
-	// crapy little files written from different parts of this code; this could also
-	// be useful for testing
-	// by having this model we can allow users to create some files before `kubeadm init` runs, e.g. PKI assets, we
-	// would then be able to look at files users has given an diff or validate if those are sane, we could also warn
-	// if any of the files had been deprecated
-
-	s := new(kubeadmapi.KubeadmConfig)
-	s.EnvParams = envParams
 
 	cmds.ResetFlags()
-	cmds.SetGlobalNormalizationFunc(flag.WarnWordSepNormalizeFunc)
 
-	cmds.AddCommand(NewCmdInit(out, s))
-	cmds.AddCommand(NewCmdJoin(out, s))
-	cmds.AddCommand(NewCmdVersion(out))
+	cmds.AddCommand(newCmdCompletion(out, ""))
+	cmds.AddCommand(newCmdConfig(out))
+	cmds.AddCommand(newCmdInit(out, nil))
+	cmds.AddCommand(newCmdJoin(out, nil))
+	cmds.AddCommand(newCmdReset(in, out, nil))
+	cmds.AddCommand(newCmdVersion(out))
+	cmds.AddCommand(newCmdToken(out, err))
+	cmds.AddCommand(upgrade.NewCmdUpgrade(out))
+	cmds.AddCommand(alpha.NewCmdAlpha(in, out))
+	options.AddKubeadmOtherFlags(cmds.PersistentFlags(), &rootfsPath)
+
+	// TODO: remove "certs" from "alpha"
+	// https://github.com/kubernetes/kubeadm/issues/2291
+	cmds.AddCommand(alpha.NewCmdCertsUtility(out))
 
 	return cmds
 }

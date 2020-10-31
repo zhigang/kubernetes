@@ -20,11 +20,11 @@ import (
 	"errors"
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/apimachinery/pkg/util/net"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/registry/core/service/allocator"
-	"k8s.io/kubernetes/pkg/util/net"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 // Interface manages the allocation of ports out of a range. Interface
@@ -33,14 +33,25 @@ type Interface interface {
 	Allocate(int) error
 	AllocateNext() (int, error)
 	Release(int) error
+	ForEach(func(int))
+
+	// For testing
+	Has(int) bool
 }
 
 var (
 	ErrFull              = errors.New("range is full")
-	ErrNotInRange        = errors.New("provided port is not in the valid range")
 	ErrAllocated         = errors.New("provided port is already allocated")
 	ErrMismatchedNetwork = errors.New("the provided port range does not match the current port range")
 )
+
+type ErrNotInRange struct {
+	ValidPorts string
+}
+
+func (e *ErrNotInRange) Error() string {
+	return fmt.Sprintf("provided port is not in the valid range. The range of valid ports is %s", e.ValidPorts)
+}
 
 type PortAllocator struct {
 	portRange net.PortRange
@@ -52,27 +63,49 @@ type PortAllocator struct {
 var _ Interface = &PortAllocator{}
 
 // NewPortAllocatorCustom creates a PortAllocator over a net.PortRange, calling allocatorFactory to construct the backing store.
-func NewPortAllocatorCustom(pr net.PortRange, allocatorFactory allocator.AllocatorFactory) *PortAllocator {
+func NewPortAllocatorCustom(pr net.PortRange, allocatorFactory allocator.AllocatorFactory) (*PortAllocator, error) {
 	max := pr.Size
 	rangeSpec := pr.String()
 
 	a := &PortAllocator{
 		portRange: pr,
 	}
-	a.alloc = allocatorFactory(max, rangeSpec)
-	return a
+	var err error
+	a.alloc, err = allocatorFactory(max, rangeSpec)
+	return a, err
 }
 
-// Helper that wraps NewAllocatorCIDRRange, for creating a range backed by an in-memory store.
-func NewPortAllocator(pr net.PortRange) *PortAllocator {
-	return NewPortAllocatorCustom(pr, func(max int, rangeSpec string) allocator.Interface {
-		return allocator.NewAllocationMap(max, rangeSpec)
+// Helper that wraps NewPortAllocatorCustom, for creating a range backed by an in-memory store.
+func NewPortAllocator(pr net.PortRange) (*PortAllocator, error) {
+	return NewPortAllocatorCustom(pr, func(max int, rangeSpec string) (allocator.Interface, error) {
+		return allocator.NewAllocationMap(max, rangeSpec), nil
 	})
+}
+
+// NewFromSnapshot allocates a PortAllocator and initializes it from a snapshot.
+func NewFromSnapshot(snap *api.RangeAllocation) (*PortAllocator, error) {
+	pr, err := net.ParsePortRange(snap.Range)
+	if err != nil {
+		return nil, err
+	}
+	r, err := NewPortAllocator(*pr)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.Restore(*pr, snap.Data); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // Free returns the count of port left in the range.
 func (r *PortAllocator) Free() int {
 	return r.alloc.Free()
+}
+
+// Used returns the count of ports used in the range.
+func (r *PortAllocator) Used() int {
+	return r.portRange.Size - r.alloc.Free()
 }
 
 // Allocate attempts to reserve the provided port. ErrNotInRange or
@@ -82,7 +115,9 @@ func (r *PortAllocator) Free() int {
 func (r *PortAllocator) Allocate(port int) error {
 	ok, offset := r.contains(port)
 	if !ok {
-		return ErrNotInRange
+		// include valid port range in error
+		validPorts := r.portRange.String()
+		return &ErrNotInRange{validPorts}
 	}
 
 	allocated, err := r.alloc.Allocate(offset)
@@ -108,13 +143,20 @@ func (r *PortAllocator) AllocateNext() (int, error) {
 	return r.portRange.Base + offset, nil
 }
 
+// ForEach calls the provided function for each allocated port.
+func (r *PortAllocator) ForEach(fn func(int)) {
+	r.alloc.ForEach(func(offset int) {
+		fn(r.portRange.Base + offset)
+	})
+}
+
 // Release releases the port back to the pool. Releasing an
 // unallocated port or a port out of the range is a no-op and
 // returns no error.
 func (r *PortAllocator) Release(port int) error {
 	ok, offset := r.contains(port)
 	if !ok {
-		glog.Warningf("port is not in the range when release it. port: %v", port)
+		klog.Warningf("port is not in the range when release it. port: %v", port)
 		return nil
 	}
 

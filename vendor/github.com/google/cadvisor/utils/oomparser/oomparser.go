@@ -15,30 +15,28 @@
 package oomparser
 
 import (
-	"bufio"
-	"fmt"
-	"io"
-	"os/exec"
 	"path"
 	"regexp"
 	"strconv"
 	"time"
 
-	"github.com/google/cadvisor/utils"
-	"github.com/google/cadvisor/utils/tail"
+	"github.com/euank/go-kmsg-parser/kmsgparser"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 var (
-	containerRegexp = regexp.MustCompile(`Task in (.*) killed as a result of limit of (.*)`)
-	lastLineRegexp  = regexp.MustCompile(`(^[A-Z][a-z]{2} .*[0-9]{1,2} [0-9]{1,2}:[0-9]{2}:[0-9]{2}) .* Killed process ([0-9]+) \(([\w]+)\)`)
+	legacyContainerRegexp = regexp.MustCompile(`Task in (.*) killed as a result of limit of (.*)`)
+	// Starting in 5.0 linux kernels, the OOM message changed
+	containerRegexp = regexp.MustCompile(`oom-kill:constraint=(.*),nodemask=(.*),cpuset=(.*),mems_allowed=(.*),oom_memcg=(.*) (.*),task_memcg=(.*),task=(.*),pid=(.*),uid=(.*)`)
+	lastLineRegexp  = regexp.MustCompile(`Killed process ([0-9]+) \((.+)\)`)
 	firstLineRegexp = regexp.MustCompile(`invoked oom-killer:`)
 )
 
-// struct to hold file from which we obtain OomInstances
+// OomParser wraps a kmsgparser in order to extract OOM events from the
+// individual kernel ring buffer messages.
 type OomParser struct {
-	ioreader *bufio.Reader
+	parser kmsgparser.Parser
 }
 
 // struct that contains information related to an OOM kill instance
@@ -55,17 +53,39 @@ type OomInstance struct {
 	// the absolute name of the container that was killed
 	// due to the OOM.
 	VictimContainerName string
+	// the constraint that triggered the OOM.  One of CONSTRAINT_NONE,
+	// CONSTRAINT_CPUSET, CONSTRAINT_MEMORY_POLICY, CONSTRAINT_MEMCG
+	Constraint string
 }
 
 // gets the container name from a line and adds it to the oomInstance.
-func getContainerName(line string, currentOomInstance *OomInstance) error {
-	parsedLine := containerRegexp.FindStringSubmatch(line)
+func getLegacyContainerName(line string, currentOomInstance *OomInstance) error {
+	parsedLine := legacyContainerRegexp.FindStringSubmatch(line)
 	if parsedLine == nil {
 		return nil
 	}
 	currentOomInstance.ContainerName = path.Join("/", parsedLine[1])
 	currentOomInstance.VictimContainerName = path.Join("/", parsedLine[2])
 	return nil
+}
+
+// gets the container name from a line and adds it to the oomInstance.
+func getContainerName(line string, currentOomInstance *OomInstance) (bool, error) {
+	parsedLine := containerRegexp.FindStringSubmatch(line)
+	if parsedLine == nil {
+		// Fall back to the legacy format if it isn't found here.
+		return false, getLegacyContainerName(line, currentOomInstance)
+	}
+	currentOomInstance.ContainerName = parsedLine[7]
+	currentOomInstance.VictimContainerName = parsedLine[5]
+	currentOomInstance.Constraint = parsedLine[1]
+	pid, err := strconv.Atoi(parsedLine[9])
+	if err != nil {
+		return false, err
+	}
+	currentOomInstance.Pid = pid
+	currentOomInstance.ProcessName = parsedLine[8]
+	return true, nil
 }
 
 // gets the pid, name, and date from a line and adds it to oomInstance
@@ -75,158 +95,80 @@ func getProcessNamePid(line string, currentOomInstance *OomInstance) (bool, erro
 	if reList == nil {
 		return false, nil
 	}
-	const longForm = "Jan _2 15:04:05 2006"
-	stringYear := strconv.Itoa(time.Now().Year())
-	linetime, err := time.ParseInLocation(longForm, reList[1]+" "+stringYear, time.Local)
-	if err != nil {
-		return false, err
-	}
 
-	currentOomInstance.TimeOfDeath = linetime
-	pid, err := strconv.Atoi(reList[2])
+	pid, err := strconv.Atoi(reList[1])
 	if err != nil {
 		return false, err
 	}
 	currentOomInstance.Pid = pid
-	currentOomInstance.ProcessName = reList[3]
+	currentOomInstance.ProcessName = reList[2]
 	return true, nil
 }
 
 // uses regex to see if line is the start of a kernel oom log
 func checkIfStartOfOomMessages(line string) bool {
-	potential_oom_start := firstLineRegexp.MatchString(line)
-	if potential_oom_start {
-		return true
-	}
-	return false
+	potentialOomStart := firstLineRegexp.MatchString(line)
+	return potentialOomStart
 }
 
-// reads the file and sends only complete lines over a channel to analyzeLines.
-// Should prevent EOF errors that occur when lines are read before being fully
-// written to the log. It reads line by line splitting on
-// the "\n" character.
-func readLinesFromFile(lineChannel chan string, ioreader *bufio.Reader) error {
-	linefragment := ""
-	var line string
-	var err error
-	for true {
-		line, err = ioreader.ReadString('\n')
-		if err != nil && err != io.EOF {
-			glog.Errorf("exiting analyzeLinesHelper with error %v", err)
-			close(lineChannel)
-			break
-		}
-		if line == "" {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		if err == nil {
-			lineChannel <- linefragment + line
-			linefragment = ""
-		} else { // err == io.EOF
-			linefragment += line
-		}
-	}
-	return err
-}
+// StreamOoms writes to a provided a stream of OomInstance objects representing
+// OOM events that are found in the logs.
+// It will block and should be called from a goroutine.
+func (p *OomParser) StreamOoms(outStream chan<- *OomInstance) {
+	kmsgEntries := p.parser.Parse()
+	defer p.parser.Close()
 
-// Calls goroutine for readLinesFromFile, which feeds it complete lines.
-// Lines are checked against a regexp to check for the pid, process name, etc.
-// At the end of an oom message group, StreamOoms adds the new oomInstance to
-// oomLog
-func (self *OomParser) StreamOoms(outStream chan *OomInstance) {
-	lineChannel := make(chan string, 10)
-	go func() {
-		readLinesFromFile(lineChannel, self.ioreader)
-	}()
-
-	for line := range lineChannel {
-		in_oom_kernel_log := checkIfStartOfOomMessages(line)
-		if in_oom_kernel_log {
+	for msg := range kmsgEntries {
+		isOomMessage := checkIfStartOfOomMessages(msg.Message)
+		if isOomMessage {
 			oomCurrentInstance := &OomInstance{
-				ContainerName: "/",
+				ContainerName:       "/",
+				VictimContainerName: "/",
+				TimeOfDeath:         msg.Timestamp,
 			}
-			for line := range lineChannel {
-				err := getContainerName(line, oomCurrentInstance)
+			for msg := range kmsgEntries {
+				finished, err := getContainerName(msg.Message, oomCurrentInstance)
 				if err != nil {
-					glog.Errorf("%v", err)
+					klog.Errorf("%v", err)
 				}
-				finished, err := getProcessNamePid(line, oomCurrentInstance)
-				if err != nil {
-					glog.Errorf("%v", err)
+				if !finished {
+					finished, err = getProcessNamePid(msg.Message, oomCurrentInstance)
+					if err != nil {
+						klog.Errorf("%v", err)
+					}
 				}
 				if finished {
+					oomCurrentInstance.TimeOfDeath = msg.Timestamp
 					break
 				}
 			}
 			outStream <- oomCurrentInstance
 		}
 	}
-	glog.Infof("exiting analyzeLines. OOM events will not be reported.")
-}
-
-func callJournalctl() (io.ReadCloser, error) {
-	cmd := exec.Command("journalctl", "-k", "-f")
-	readcloser, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	return readcloser, err
-}
-
-func trySystemd() (*OomParser, error) {
-	readcloser, err := callJournalctl()
-	if err != nil {
-		return nil, err
-	}
-	glog.Infof("oomparser using systemd")
-	return &OomParser{
-		ioreader: bufio.NewReader(readcloser),
-	}, nil
-}
-
-// List of possible kernel log files. These are prioritized in order so that
-// we will use the first one that is available.
-var kernelLogFiles = []string{"/var/log/kern.log", "/var/log/messages", "/var/log/syslog"}
-
-// looks for system files that contain kernel messages and if one is found, sets
-// the systemFile attribute of the OomParser object
-func getLogFile() (string, error) {
-	for _, logFile := range kernelLogFiles {
-		if utils.FileExists(logFile) {
-			glog.Infof("OOM parser using kernel log file: %q", logFile)
-			return logFile, nil
-		}
-	}
-	return "", fmt.Errorf("unable to find any kernel log file available from our set: %v", kernelLogFiles)
-}
-
-func tryLogFile() (*OomParser, error) {
-	logFile, err := getLogFile()
-	if err != nil {
-		return nil, err
-	}
-	tail, err := tail.NewTail(logFile)
-	if err != nil {
-		return nil, err
-	}
-	return &OomParser{
-		ioreader: bufio.NewReader(tail),
-	}, nil
+	// Should not happen
+	klog.Errorf("exiting analyzeLines. OOM events will not be reported.")
 }
 
 // initializes an OomParser object. Returns an OomParser object and an error.
 func New() (*OomParser, error) {
-	parser, err := trySystemd()
-	if err == nil {
-		return parser, nil
+	parser, err := kmsgparser.NewParser()
+	if err != nil {
+		return nil, err
 	}
-	parser, err = tryLogFile()
-	if err == nil {
-		return parser, nil
-	}
-	return nil, err
+	parser.SetLogger(glogAdapter{})
+	return &OomParser{parser: parser}, nil
+}
+
+type glogAdapter struct{}
+
+var _ kmsgparser.Logger = glogAdapter{}
+
+func (glogAdapter) Infof(format string, args ...interface{}) {
+	klog.V(4).Infof(format, args...)
+}
+func (glogAdapter) Warningf(format string, args ...interface{}) {
+	klog.V(2).Infof(format, args...)
+}
+func (glogAdapter) Errorf(format string, args ...interface{}) {
+	klog.Warningf(format, args...)
 }

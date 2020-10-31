@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2016 The Kubernetes Authors.
 #
@@ -14,25 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This script is a vestigial redirection.  Please do not add "real" logic.
+# This script has been replaced by `make test-integration`.
+# `make test-integration` runs all integration tests.
+# Usage: `make test-integration`.
+# Note: This script is a vestigial redirection. Please do not add "real" logic.
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
-
-# For help output
-ARGHELP=""
-if [[ "$#" -gt 0 ]]; then
-    ARGHELP="WHAT='$@'"
-fi
-
-echo "NOTE: $0 has been replaced by 'make test-integration'"
+echo "$0 has been replaced by 'make test-integration'"
 echo
-echo "The equivalent of this invocation is: "
-echo "    make test-integration ${ARGHELP}"
+echo "The following invocation will run all integration tests: "
+echo '    make test-integration'
 echo
+echo "The following invocation will run a specific test with the verbose flag set: "
+echo '    make test-integration WHAT=./test/integration/pods GOFLAGS="-v" KUBE_TEST_ARGS="-run ^TestPodUpdateActiveDeadlineSeconds$"'
 echo
-make --no-print-directory -C "${KUBE_ROOT}" test-integration WHAT="$*"
-
+exit 1

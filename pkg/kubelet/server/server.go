@@ -17,60 +17,88 @@ limitations under the License.
 package server
 
 import (
+	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"reflect"
+	goruntime "runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	restful "github.com/emicklei/go-restful"
-	"github.com/golang/glog"
+	"github.com/emicklei/go-restful"
+	cadvisormetrics "github.com/google/cadvisor/container"
 	cadvisorapi "github.com/google/cadvisor/info/v1"
-	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
-	"github.com/prometheus/client_golang/prometheus"
+	cadvisorv2 "github.com/google/cadvisor/info/v2"
+	"github.com/google/cadvisor/metrics"
+	"google.golang.org/grpc"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/kubelet/metrics/collectors"
+	"k8s.io/utils/clock"
 
-	"k8s.io/kubernetes/pkg/api"
-	apierrs "k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/api/validation"
-	"k8s.io/kubernetes/pkg/auth/authenticator"
-	"k8s.io/kubernetes/pkg/auth/authorizer"
-	"k8s.io/kubernetes/pkg/healthz"
-	"k8s.io/kubernetes/pkg/httplog"
-	"k8s.io/kubernetes/pkg/kubelet/cm"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/proxy"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/server/healthz"
+	"k8s.io/apiserver/pkg/server/httplog"
+	"k8s.io/apiserver/pkg/server/routes"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apiserver/pkg/util/flushwriter"
+	"k8s.io/component-base/configz"
+	"k8s.io/component-base/logs"
+	compbasemetrics "k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/legacyregistry"
+	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1alpha1"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/v1/validation"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/apis/podresources"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/kubelet/server/portforward"
-	"k8s.io/kubernetes/pkg/kubelet/server/remotecommand"
+	"k8s.io/kubernetes/pkg/kubelet/cri/streaming"
+	"k8s.io/kubernetes/pkg/kubelet/cri/streaming/portforward"
+	remotecommandserver "k8s.io/kubernetes/pkg/kubelet/cri/streaming/remotecommand"
+	"k8s.io/kubernetes/pkg/kubelet/prober"
+	servermetrics "k8s.io/kubernetes/pkg/kubelet/server/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/server/stats"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util/configz"
-	"k8s.io/kubernetes/pkg/util/flushwriter"
-	"k8s.io/kubernetes/pkg/util/httpstream"
-	"k8s.io/kubernetes/pkg/util/httpstream/spdy"
-	"k8s.io/kubernetes/pkg/util/limitwriter"
-	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
-	"k8s.io/kubernetes/pkg/util/term"
-	"k8s.io/kubernetes/pkg/volume"
+	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
+	"k8s.io/kubernetes/pkg/kubelet/util"
+)
+
+const (
+	metricsPath         = "/metrics"
+	cadvisorMetricsPath = "/metrics/cadvisor"
+	resourceMetricsPath = "/metrics/resource"
+	proberMetricsPath   = "/metrics/probes"
+	specPath            = "/spec/"
+	statsPath           = "/stats/"
+	logsPath            = "/logs/"
 )
 
 // Server is a http.Handler which exposes kubelet functionality over HTTP.
 type Server struct {
-	auth             AuthInterface
-	host             HostInterface
-	restfulCont      containerInterface
-	resourceAnalyzer stats.ResourceAnalyzer
-	runtime          kubecontainer.Runtime
+	auth                       AuthInterface
+	host                       HostInterface
+	restfulCont                containerInterface
+	metricsBuckets             sets.String
+	metricsMethodBuckets       sets.String
+	resourceAnalyzer           stats.ResourceAnalyzer
+	redirectContainerStreaming bool
 }
 
+// TLSOptions holds the TLS options.
 type TLSOptions struct {
 	Config   *tls.Config
 	CertFile string
@@ -113,34 +141,54 @@ func ListenAndServeKubeletServer(
 	port uint,
 	tlsOptions *TLSOptions,
 	auth AuthInterface,
-	enableDebuggingHandlers bool,
-	runtime kubecontainer.Runtime) {
-	glog.Infof("Starting to listen on %s:%d", address, port)
-	handler := NewServer(host, resourceAnalyzer, auth, enableDebuggingHandlers, runtime)
+	enableCAdvisorJSONEndpoints,
+	enableDebuggingHandlers,
+	enableContentionProfiling,
+	redirectContainerStreaming,
+	enableSystemLogHandler bool,
+	criHandler http.Handler) {
+	klog.Infof("Starting to listen on %s:%d", address, port)
+	handler := NewServer(host, resourceAnalyzer, auth, enableCAdvisorJSONEndpoints, enableDebuggingHandlers, enableContentionProfiling, redirectContainerStreaming, enableSystemLogHandler, criHandler)
 	s := &http.Server{
 		Addr:           net.JoinHostPort(address.String(), strconv.FormatUint(uint64(port), 10)),
 		Handler:        &handler,
+		ReadTimeout:    4 * 60 * time.Minute,
+		WriteTimeout:   4 * 60 * time.Minute,
 		MaxHeaderBytes: 1 << 20,
 	}
 	if tlsOptions != nil {
 		s.TLSConfig = tlsOptions.Config
-		glog.Fatal(s.ListenAndServeTLS(tlsOptions.CertFile, tlsOptions.KeyFile))
+		// Passing empty strings as the cert and key files means no
+		// cert/keys are specified and GetCertificate in the TLSConfig
+		// should be called instead.
+		klog.Fatal(s.ListenAndServeTLS(tlsOptions.CertFile, tlsOptions.KeyFile))
 	} else {
-		glog.Fatal(s.ListenAndServe())
+		klog.Fatal(s.ListenAndServe())
 	}
 }
 
 // ListenAndServeKubeletReadOnlyServer initializes a server to respond to HTTP network requests on the Kubelet.
-func ListenAndServeKubeletReadOnlyServer(host HostInterface, resourceAnalyzer stats.ResourceAnalyzer, address net.IP, port uint, runtime kubecontainer.Runtime) {
-	glog.V(1).Infof("Starting to listen read-only on %s:%d", address, port)
-	s := NewServer(host, resourceAnalyzer, nil, false, runtime)
+func ListenAndServeKubeletReadOnlyServer(host HostInterface, resourceAnalyzer stats.ResourceAnalyzer, address net.IP, port uint, enableCAdvisorJSONEndpoints bool) {
+	klog.V(1).Infof("Starting to listen read-only on %s:%d", address, port)
+	s := NewServer(host, resourceAnalyzer, nil, enableCAdvisorJSONEndpoints, false, false, false, false, nil)
 
 	server := &http.Server{
 		Addr:           net.JoinHostPort(address.String(), strconv.FormatUint(uint64(port), 10)),
 		Handler:        &s,
 		MaxHeaderBytes: 1 << 20,
 	}
-	glog.Fatal(server.ListenAndServe())
+	klog.Fatal(server.ListenAndServe())
+}
+
+// ListenAndServePodResources initializes a gRPC server to serve the PodResources service
+func ListenAndServePodResources(socket string, podsProvider podresources.PodsProvider, devicesProvider podresources.DevicesProvider) {
+	server := grpc.NewServer()
+	podresourcesapi.RegisterPodResourcesListerServer(server, podresources.NewPodResourcesServer(podsProvider, devicesProvider))
+	l, err := util.CreateListener(socket)
+	if err != nil {
+		klog.Fatalf("Failed to create listener for podResources endpoint: %v", err)
+	}
+	klog.Fatal(server.Serve(l))
 }
 
 // AuthInterface contains all methods required by the auth filters
@@ -151,31 +199,21 @@ type AuthInterface interface {
 }
 
 // HostInterface contains all the kubelet methods required by the server.
-// For testablitiy.
+// For testability.
 type HostInterface interface {
-	GetContainerInfo(podFullName string, uid types.UID, containerName string, req *cadvisorapi.ContainerInfoRequest) (*cadvisorapi.ContainerInfo, error)
-	GetContainerInfoV2(name string, options cadvisorapiv2.RequestOptions) (map[string]cadvisorapiv2.ContainerInfo, error)
-	GetRawContainerInfo(containerName string, req *cadvisorapi.ContainerInfoRequest, subcontainers bool) (map[string]*cadvisorapi.ContainerInfo, error)
+	stats.Provider
+	GetVersionInfo() (*cadvisorapi.VersionInfo, error)
 	GetCachedMachineInfo() (*cadvisorapi.MachineInfo, error)
-	GetPods() []*api.Pod
-	GetRunningPods() ([]*api.Pod, error)
-	GetPodByName(namespace, name string) (*api.Pod, bool)
+	GetRunningPods() ([]*v1.Pod, error)
 	RunInContainer(name string, uid types.UID, container string, cmd []string) ([]byte, error)
-	ExecInContainer(name string, uid types.UID, container string, cmd []string, in io.Reader, out, err io.WriteCloser, tty bool, resize <-chan term.Size) error
-	AttachContainer(name string, uid types.UID, container string, in io.Reader, out, err io.WriteCloser, tty bool, resize <-chan term.Size) error
-	GetKubeletContainerLogs(podFullName, containerName string, logOptions *api.PodLogOptions, stdout, stderr io.Writer) error
+	GetKubeletContainerLogs(ctx context.Context, podFullName, containerName string, logOptions *v1.PodLogOptions, stdout, stderr io.Writer) error
 	ServeLogs(w http.ResponseWriter, req *http.Request)
-	PortForward(name string, uid types.UID, port uint16, stream io.ReadWriteCloser) error
-	StreamingConnectionIdleTimeout() time.Duration
 	ResyncInterval() time.Duration
 	GetHostname() string
-	GetNode() (*api.Node, error)
-	GetNodeConfig() cm.NodeConfig
 	LatestLoopEntryTime() time.Time
-	ImagesFsInfo() (cadvisorapiv2.FsInfo, error)
-	RootFsInfo() (cadvisorapiv2.FsInfo, error)
-	ListVolumesForPod(podUID types.UID) (map[string]volume.Volume, bool)
-	PLEGHealthCheck() (bool, error)
+	GetExec(podFullName string, podUID types.UID, containerName string, cmd []string, streamOpts remotecommandserver.Options) (*url.URL, error)
+	GetAttach(podFullName string, podUID types.UID, containerName string, streamOpts remotecommandserver.Options) (*url.URL, error)
+	GetPortForward(podName, podNamespace string, podUID types.UID, portForwardOpts portforward.V4Options) (*url.URL, error)
 }
 
 // NewServer initializes and configures a kubelet.Server object to handle HTTP requests.
@@ -183,21 +221,35 @@ func NewServer(
 	host HostInterface,
 	resourceAnalyzer stats.ResourceAnalyzer,
 	auth AuthInterface,
-	enableDebuggingHandlers bool,
-	runtime kubecontainer.Runtime) Server {
+	enableCAdvisorJSONEndpoints,
+	enableDebuggingHandlers,
+	enableContentionProfiling,
+	redirectContainerStreaming,
+	enableSystemLogHandler bool,
+	criHandler http.Handler) Server {
 	server := Server{
-		host:             host,
-		resourceAnalyzer: resourceAnalyzer,
-		auth:             auth,
-		restfulCont:      &filteringContainer{Container: restful.NewContainer()},
-		runtime:          runtime,
+		host:                       host,
+		resourceAnalyzer:           resourceAnalyzer,
+		auth:                       auth,
+		restfulCont:                &filteringContainer{Container: restful.NewContainer()},
+		metricsBuckets:             sets.NewString(),
+		metricsMethodBuckets:       sets.NewString("OPTIONS", "GET", "HEAD", "POST", "PUT", "DELETE", "TRACE", "CONNECT"),
+		redirectContainerStreaming: redirectContainerStreaming,
 	}
 	if auth != nil {
 		server.InstallAuthFilter()
 	}
-	server.InstallDefaultHandlers()
+	server.InstallDefaultHandlers(enableCAdvisorJSONEndpoints)
 	if enableDebuggingHandlers {
-		server.InstallDebuggingHandlers()
+		server.InstallDebuggingHandlers(criHandler)
+		// To maintain backward compatibility serve logs only when enableDebuggingHandlers is also enabled
+		// see https://github.com/kubernetes/kubernetes/pull/87273
+		server.InstallSystemLogHandler(enableSystemLogHandler)
+		if enableContentionProfiling {
+			goruntime.SetBlockProfileRate(1)
+		}
+	} else {
+		server.InstallDebuggingDisabledHandlers()
 	}
 	return server
 }
@@ -206,9 +258,9 @@ func NewServer(
 func (s *Server) InstallAuthFilter() {
 	s.restfulCont.Filter(func(req *restful.Request, resp *restful.Response, chain *restful.FilterChain) {
 		// Authenticate
-		u, ok, err := s.auth.AuthenticateRequest(req.Request)
+		info, ok, err := s.auth.AuthenticateRequest(req.Request)
 		if err != nil {
-			glog.Errorf("Unable to authenticate the request due to an error: %v", err)
+			klog.Errorf("Unable to authenticate the request due to an error: %v", err)
 			resp.WriteErrorString(http.StatusUnauthorized, "Unauthorized")
 			return
 		}
@@ -218,19 +270,19 @@ func (s *Server) InstallAuthFilter() {
 		}
 
 		// Get authorization attributes
-		attrs := s.auth.GetRequestAttributes(u, req.Request)
+		attrs := s.auth.GetRequestAttributes(info.User, req.Request)
 
 		// Authorize
-		authorized, reason, err := s.auth.Authorize(attrs)
+		decision, _, err := s.auth.Authorize(req.Request.Context(), attrs)
 		if err != nil {
-			msg := fmt.Sprintf("Error (user=%s, verb=%s, namespace=%s, resource=%s)", u.GetName(), attrs.GetVerb(), attrs.GetNamespace(), attrs.GetResource())
-			glog.Errorf(msg, err)
+			msg := fmt.Sprintf("Authorization error (user=%s, verb=%s, resource=%s, subresource=%s)", attrs.GetUser().GetName(), attrs.GetVerb(), attrs.GetResource(), attrs.GetSubresource())
+			klog.Errorf(msg, err)
 			resp.WriteErrorString(http.StatusInternalServerError, msg)
 			return
 		}
-		if !authorized {
-			msg := fmt.Sprintf("Forbidden (reason=%s, user=%s, verb=%s, namespace=%s, resource=%s)", reason, u.GetName(), attrs.GetVerb(), attrs.GetNamespace(), attrs.GetResource())
-			glog.V(2).Info(msg)
+		if decision != authorizer.DecisionAllow {
+			msg := fmt.Sprintf("Forbidden (user=%s, verb=%s, resource=%s, subresource=%s)", attrs.GetUser().GetName(), attrs.GetVerb(), attrs.GetResource(), attrs.GetSubresource())
+			klog.V(2).Info(msg)
 			resp.WriteErrorString(http.StatusForbidden, msg)
 			return
 		}
@@ -240,16 +292,41 @@ func (s *Server) InstallAuthFilter() {
 	})
 }
 
+// addMetricsBucketMatcher adds a regexp matcher and the relevant bucket to use when
+// it matches. Please be aware this is not thread safe and should not be used dynamically
+func (s *Server) addMetricsBucketMatcher(bucket string) {
+	s.metricsBuckets.Insert(bucket)
+}
+
+// getMetricBucket find the appropriate metrics reporting bucket for the given path
+func (s *Server) getMetricBucket(path string) string {
+	root := getURLRootPath(path)
+	if s.metricsBuckets.Has(root) {
+		return root
+	}
+	return "other"
+}
+
+// getMetricMethodBucket checks for unknown or invalid HTTP verbs
+func (s *Server) getMetricMethodBucket(method string) string {
+	if s.metricsMethodBuckets.Has(method) {
+		return method
+	}
+	return "other"
+}
+
 // InstallDefaultHandlers registers the default set of supported HTTP request
 // patterns with the restful Container.
-func (s *Server) InstallDefaultHandlers() {
+func (s *Server) InstallDefaultHandlers(enableCAdvisorJSONEndpoints bool) {
+	s.addMetricsBucketMatcher("healthz")
 	healthz.InstallHandler(s.restfulCont,
 		healthz.PingHealthz,
+		healthz.LogHealthz,
 		healthz.NamedCheck("syncloop", s.syncLoopHealthCheck),
-		healthz.NamedCheck("pleg", s.plegHealthCheck),
 	)
-	var ws *restful.WebService
-	ws = new(restful.WebService)
+
+	s.addMetricsBucketMatcher("pods")
+	ws := new(restful.WebService)
 	ws.
 		Path("/pods").
 		Produces(restful.MIME_JSON)
@@ -258,27 +335,85 @@ func (s *Server) InstallDefaultHandlers() {
 		Operation("getPods"))
 	s.restfulCont.Add(ws)
 
-	s.restfulCont.Add(stats.CreateHandlers(s.host, s.resourceAnalyzer))
-	s.restfulCont.Handle("/metrics", prometheus.Handler())
+	s.addMetricsBucketMatcher("stats")
+	s.restfulCont.Add(stats.CreateHandlers(statsPath, s.host, s.resourceAnalyzer, enableCAdvisorJSONEndpoints))
 
-	ws = new(restful.WebService)
-	ws.
-		Path("/spec/").
-		Produces(restful.MIME_JSON)
-	ws.Route(ws.GET("").
-		To(s.getSpec).
-		Operation("getSpec").
-		Writes(cadvisorapi.MachineInfo{}))
-	s.restfulCont.Add(ws)
+	s.addMetricsBucketMatcher("metrics")
+	s.addMetricsBucketMatcher("metrics/cadvisor")
+	s.addMetricsBucketMatcher("metrics/probes")
+	s.addMetricsBucketMatcher("metrics/resource")
+	//lint:ignore SA1019 https://github.com/kubernetes/enhancements/issues/1206
+	s.restfulCont.Handle(metricsPath, legacyregistry.Handler())
+
+	// cAdvisor metrics are exposed under the secured handler as well
+	r := compbasemetrics.NewKubeRegistry()
+
+	includedMetrics := cadvisormetrics.MetricSet{
+		cadvisormetrics.CpuUsageMetrics:     struct{}{},
+		cadvisormetrics.MemoryUsageMetrics:  struct{}{},
+		cadvisormetrics.CpuLoadMetrics:      struct{}{},
+		cadvisormetrics.DiskIOMetrics:       struct{}{},
+		cadvisormetrics.DiskUsageMetrics:    struct{}{},
+		cadvisormetrics.NetworkUsageMetrics: struct{}{},
+		cadvisormetrics.AppMetrics:          struct{}{},
+		cadvisormetrics.ProcessMetrics:      struct{}{},
+	}
+
+	// Only add the Accelerator metrics if the feature is inactive
+	// Note: Accelerator metrics will be removed in the future, hence the feature gate.
+	if !utilfeature.DefaultFeatureGate.Enabled(features.DisableAcceleratorUsageMetrics) {
+		includedMetrics.Add(cadvisormetrics.MetricKind(cadvisormetrics.AcceleratorUsageMetrics))
+	}
+
+	cadvisorOpts := cadvisorv2.RequestOptions{
+		IdType:    cadvisorv2.TypeName,
+		Count:     1,
+		Recursive: true,
+	}
+	r.RawMustRegister(metrics.NewPrometheusCollector(prometheusHostAdapter{s.host}, containerPrometheusLabelsFunc(s.host), includedMetrics, clock.RealClock{}, cadvisorOpts))
+	s.restfulCont.Handle(cadvisorMetricsPath,
+		compbasemetrics.HandlerFor(r, compbasemetrics.HandlerOpts{ErrorHandling: compbasemetrics.ContinueOnError}),
+	)
+
+	s.addMetricsBucketMatcher("metrics/resource")
+	resourceRegistry := compbasemetrics.NewKubeRegistry()
+	resourceRegistry.CustomMustRegister(collectors.NewResourceMetricsCollector(s.resourceAnalyzer))
+	s.restfulCont.Handle(resourceMetricsPath,
+		compbasemetrics.HandlerFor(resourceRegistry, compbasemetrics.HandlerOpts{ErrorHandling: compbasemetrics.ContinueOnError}),
+	)
+
+	// prober metrics are exposed under a different endpoint
+
+	s.addMetricsBucketMatcher("metrics/probes")
+	p := compbasemetrics.NewKubeRegistry()
+	_ = compbasemetrics.RegisterProcessStartTime(p.Register)
+	p.MustRegister(prober.ProberResults)
+	s.restfulCont.Handle(proberMetricsPath,
+		compbasemetrics.HandlerFor(p, compbasemetrics.HandlerOpts{ErrorHandling: compbasemetrics.ContinueOnError}),
+	)
+
+	s.addMetricsBucketMatcher("spec")
+	if enableCAdvisorJSONEndpoints {
+		ws := new(restful.WebService)
+		ws.
+			Path(specPath).
+			Produces(restful.MIME_JSON)
+		ws.Route(ws.GET("").
+			To(s.getSpec).
+			Operation("getSpec").
+			Writes(cadvisorapi.MachineInfo{}))
+		s.restfulCont.Add(ws)
+	}
 }
 
 const pprofBasePath = "/debug/pprof/"
 
-// InstallDeguggingHandlers registers the HTTP request patterns that serve logs or run commands/containers
-func (s *Server) InstallDebuggingHandlers() {
-	var ws *restful.WebService
+// InstallDebuggingHandlers registers the HTTP request patterns that serve logs or run commands/containers
+func (s *Server) InstallDebuggingHandlers(criHandler http.Handler) {
+	klog.Infof("Adding debug handlers to kubelet server.")
 
-	ws = new(restful.WebService)
+	s.addMetricsBucketMatcher("run")
+	ws := new(restful.WebService)
 	ws.
 		Path("/run")
 	ws.Route(ws.POST("/{podNamespace}/{podID}/{containerName}").
@@ -289,6 +424,7 @@ func (s *Server) InstallDebuggingHandlers() {
 		Operation("getRun"))
 	s.restfulCont.Add(ws)
 
+	s.addMetricsBucketMatcher("exec")
 	ws = new(restful.WebService)
 	ws.
 		Path("/exec")
@@ -306,6 +442,7 @@ func (s *Server) InstallDebuggingHandlers() {
 		Operation("getExec"))
 	s.restfulCont.Add(ws)
 
+	s.addMetricsBucketMatcher("attach")
 	ws = new(restful.WebService)
 	ws.
 		Path("/attach")
@@ -323,10 +460,17 @@ func (s *Server) InstallDebuggingHandlers() {
 		Operation("getAttach"))
 	s.restfulCont.Add(ws)
 
+	s.addMetricsBucketMatcher("portForward")
 	ws = new(restful.WebService)
 	ws.
 		Path("/portForward")
+	ws.Route(ws.GET("/{podNamespace}/{podID}").
+		To(s.getPortForward).
+		Operation("getPortForward"))
 	ws.Route(ws.POST("/{podNamespace}/{podID}").
+		To(s.getPortForward).
+		Operation("getPortForward"))
+	ws.Route(ws.GET("/{podNamespace}/{podID}/{uid}").
 		To(s.getPortForward).
 		Operation("getPortForward"))
 	ws.Route(ws.POST("/{podNamespace}/{podID}/{uid}").
@@ -334,18 +478,7 @@ func (s *Server) InstallDebuggingHandlers() {
 		Operation("getPortForward"))
 	s.restfulCont.Add(ws)
 
-	ws = new(restful.WebService)
-	ws.
-		Path("/logs/")
-	ws.Route(ws.GET("").
-		To(s.getLogs).
-		Operation("getLogs"))
-	ws.Route(ws.GET("/{logpath:*}").
-		To(s.getLogs).
-		Operation("getLogs").
-		Param(ws.PathParameter("logpath", "path to the log").DataType("string")))
-	s.restfulCont.Add(ws)
-
+	s.addMetricsBucketMatcher("containerLogs")
 	ws = new(restful.WebService)
 	ws.
 		Path("/containerLogs")
@@ -354,8 +487,10 @@ func (s *Server) InstallDebuggingHandlers() {
 		Operation("getContainerLogs"))
 	s.restfulCont.Add(ws)
 
+	s.addMetricsBucketMatcher("configz")
 	configz.InstallHandler(s.restfulCont)
 
+	s.addMetricsBucketMatcher("debug")
 	handlePprofEndpoint := func(req *restful.Request, resp *restful.Response) {
 		name := strings.TrimPrefix(req.Request.URL.Path, pprofBasePath)
 		switch name {
@@ -365,11 +500,12 @@ func (s *Server) InstallDebuggingHandlers() {
 			pprof.Symbol(resp, req.Request)
 		case "cmdline":
 			pprof.Cmdline(resp, req.Request)
+		case "trace":
+			pprof.Trace(resp, req.Request)
 		default:
 			pprof.Index(resp, req.Request)
 		}
 	}
-
 	// Setup pprof handlers.
 	ws = new(restful.WebService).Path(pprofBasePath)
 	ws.Route(ws.GET("/{subpath:*}").To(func(req *restful.Request, resp *restful.Response) {
@@ -377,7 +513,12 @@ func (s *Server) InstallDebuggingHandlers() {
 	})).Doc("pprof endpoint")
 	s.restfulCont.Add(ws)
 
+	// Setup flags handlers.
+	// so far, only logging related endpoints are considered valid to add for these debug flags.
+	s.restfulCont.Handle("/debug/flags/v", routes.StringFlagPutHandler(logs.GlogSetter))
+
 	// The /runningpods endpoint is used for testing only.
+	s.addMetricsBucketMatcher("runningpods")
 	ws = new(restful.WebService)
 	ws.
 		Path("/runningpods/").
@@ -386,14 +527,55 @@ func (s *Server) InstallDebuggingHandlers() {
 		To(s.getRunningPods).
 		Operation("getRunningPods"))
 	s.restfulCont.Add(ws)
+
+	s.addMetricsBucketMatcher("cri")
+	if criHandler != nil {
+		s.restfulCont.Handle("/cri/", criHandler)
+	}
 }
 
-type httpHandler struct {
-	f func(w http.ResponseWriter, r *http.Request)
+// InstallDebuggingDisabledHandlers registers the HTTP request patterns that provide better error message
+func (s *Server) InstallDebuggingDisabledHandlers() {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Debug endpoints are disabled.", http.StatusMethodNotAllowed)
+	})
+
+	s.addMetricsBucketMatcher("run")
+	s.addMetricsBucketMatcher("exec")
+	s.addMetricsBucketMatcher("attach")
+	s.addMetricsBucketMatcher("portForward")
+	s.addMetricsBucketMatcher("containerLogs")
+	s.addMetricsBucketMatcher("runningpods")
+	s.addMetricsBucketMatcher("pprof")
+	s.addMetricsBucketMatcher("logs")
+	paths := []string{
+		"/run/", "/exec/", "/attach/", "/portForward/", "/containerLogs/",
+		"/runningpods/", pprofBasePath, logsPath}
+	for _, p := range paths {
+		s.restfulCont.Handle(p, h)
+	}
 }
 
-func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.f(w, r)
+// InstallSystemLogHandler registers the HTTP request patterns for logs endpoint.
+func (s *Server) InstallSystemLogHandler(enableSystemLogHandler bool) {
+	s.addMetricsBucketMatcher("logs")
+	if enableSystemLogHandler {
+		ws := new(restful.WebService)
+		ws.Path(logsPath)
+		ws.Route(ws.GET("").
+			To(s.getLogs).
+			Operation("getLogs"))
+		ws.Route(ws.GET("/{logpath:*}").
+			To(s.getLogs).
+			Operation("getLogs").
+			Param(ws.PathParameter("logpath", "path to the log").DataType("string")))
+		s.restfulCont.Add(ws)
+	} else {
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "logs endpoint is disabled.", http.StatusMethodNotAllowed)
+		})
+		s.restfulCont.Handle(logsPath, h)
+	}
 }
 
 // Checks if kubelet's sync loop  that updates containers is working.
@@ -405,15 +587,7 @@ func (s *Server) syncLoopHealthCheck(req *http.Request) error {
 	}
 	enterLoopTime := s.host.LatestLoopEntryTime()
 	if !enterLoopTime.IsZero() && time.Now().After(enterLoopTime.Add(duration)) {
-		return fmt.Errorf("Sync Loop took longer than expected.")
-	}
-	return nil
-}
-
-// Checks if pleg, which lists pods periodically, is healthy.
-func (s *Server) plegHealthCheck(req *http.Request) error {
-	if ok, err := s.host.PLEGHealthCheck(); !ok {
-		return fmt.Errorf("PLEG took longer than expected: %v", err)
+		return fmt.Errorf("sync Loop took longer than expected")
 	}
 	return nil
 }
@@ -423,6 +597,7 @@ func (s *Server) getContainerLogs(request *restful.Request, response *restful.Re
 	podNamespace := request.PathParameter("podNamespace")
 	podID := request.PathParameter("podID")
 	containerName := request.PathParameter("containerName")
+	ctx := request.Request.Context()
 
 	if len(podID) == 0 {
 		// TODO: Why return JSON when the rest return plaintext errors?
@@ -451,69 +626,51 @@ func (s *Server) getContainerLogs(request *restful.Request, response *restful.Re
 		}
 	}
 	// container logs on the kubelet are locked to the v1 API version of PodLogOptions
-	logOptions := &api.PodLogOptions{}
-	if err := api.ParameterCodec.DecodeParameters(query, v1.SchemeGroupVersion, logOptions); err != nil {
+	logOptions := &v1.PodLogOptions{}
+	if err := legacyscheme.ParameterCodec.DecodeParameters(query, v1.SchemeGroupVersion, logOptions); err != nil {
 		response.WriteError(http.StatusBadRequest, fmt.Errorf(`{"message": "Unable to decode query."}`))
 		return
 	}
-	logOptions.TypeMeta = unversioned.TypeMeta{}
+	logOptions.TypeMeta = metav1.TypeMeta{}
 	if errs := validation.ValidatePodLogOptions(logOptions); len(errs) > 0 {
-		response.WriteError(apierrs.StatusUnprocessableEntity, fmt.Errorf(`{"message": "Invalid request."}`))
+		response.WriteError(http.StatusUnprocessableEntity, fmt.Errorf(`{"message": "Invalid request."}`))
 		return
 	}
 
 	pod, ok := s.host.GetPodByName(podNamespace, podID)
 	if !ok {
-		response.WriteError(http.StatusNotFound, fmt.Errorf("pod %q does not exist\n", podID))
+		response.WriteError(http.StatusNotFound, fmt.Errorf("pod %q does not exist", podID))
 		return
 	}
 	// Check if containerName is valid.
-	containerExists := false
-	for _, container := range pod.Spec.Containers {
-		if container.Name == containerName {
-			containerExists = true
-		}
-	}
-	if !containerExists {
-		for _, container := range pod.Spec.InitContainers {
-			if container.Name == containerName {
-				containerExists = true
-			}
-		}
-	}
-	if !containerExists {
-		response.WriteError(http.StatusNotFound, fmt.Errorf("container %q not found in pod %q\n", containerName, podID))
+	if kubecontainer.GetContainerSpec(pod, containerName) == nil {
+		response.WriteError(http.StatusNotFound, fmt.Errorf("container %q not found in pod %q", containerName, podID))
 		return
 	}
 
 	if _, ok := response.ResponseWriter.(http.Flusher); !ok {
-		response.WriteError(http.StatusInternalServerError, fmt.Errorf("unable to convert %v into http.Flusher, cannot show logs\n", reflect.TypeOf(response)))
+		response.WriteError(http.StatusInternalServerError, fmt.Errorf("unable to convert %v into http.Flusher, cannot show logs", reflect.TypeOf(response)))
 		return
 	}
 	fw := flushwriter.Wrap(response.ResponseWriter)
-	if logOptions.LimitBytes != nil {
-		fw = limitwriter.New(fw, *logOptions.LimitBytes)
-	}
 	response.Header().Set("Transfer-Encoding", "chunked")
-	if err := s.host.GetKubeletContainerLogs(kubecontainer.GetPodFullName(pod), containerName, logOptions, fw, fw); err != nil {
-		if err != limitwriter.ErrMaximumWrite {
-			response.WriteError(http.StatusBadRequest, err)
-		}
+	if err := s.host.GetKubeletContainerLogs(ctx, kubecontainer.GetPodFullName(pod), containerName, logOptions, fw, fw); err != nil {
+		response.WriteError(http.StatusBadRequest, err)
 		return
 	}
 }
 
-// encodePods creates an api.PodList object from pods and returns the encoded
+// encodePods creates an v1.PodList object from pods and returns the encoded
 // PodList.
-func encodePods(pods []*api.Pod) (data []byte, err error) {
-	podList := new(api.PodList)
+func encodePods(pods []*v1.Pod) (data []byte, err error) {
+	podList := new(v1.PodList)
 	for _, pod := range pods {
 		podList.Items = append(podList.Items, *pod)
 	}
 	// TODO: this needs to be parameterized to the kubelet, not hardcoded. Depends on Kubelet
 	//   as API server refactor.
 	// TODO: Locked to v1, needs to be made generic
-	codec := api.Codecs.LegacyCodec(unversioned.GroupVersion{Group: api.GroupName, Version: "v1"})
+	codec := legacyscheme.Codecs.LegacyCodec(schema.GroupVersion{Group: v1.GroupName, Version: "v1"})
 	return runtime.Encode(codec, podList)
 }
 
@@ -525,7 +682,7 @@ func (s *Server) getPods(request *restful.Request, response *restful.Response) {
 		response.WriteError(http.StatusInternalServerError, err)
 		return
 	}
-	writeJsonResponse(response, data)
+	writeJSONResponse(response, data)
 }
 
 // getRunningPods returns a list of pods running on Kubelet. The list is
@@ -542,7 +699,7 @@ func (s *Server) getRunningPods(request *restful.Request, response *restful.Resp
 		response.WriteError(http.StatusInternalServerError, err)
 		return
 	}
-	writeJsonResponse(response, data)
+	writeJSONResponse(response, data)
 }
 
 // getLogs handles logs requests against the Kubelet.
@@ -560,84 +717,130 @@ func (s *Server) getSpec(request *restful.Request, response *restful.Response) {
 	response.WriteEntity(info)
 }
 
-func getContainerCoordinates(request *restful.Request) (namespace, pod string, uid types.UID, container string) {
-	namespace = request.PathParameter("podNamespace")
-	pod = request.PathParameter("podID")
-	if uidStr := request.PathParameter("uid"); uidStr != "" {
-		uid = types.UID(uidStr)
+type execRequestParams struct {
+	podNamespace  string
+	podName       string
+	podUID        types.UID
+	containerName string
+	cmd           []string
+}
+
+func getExecRequestParams(req *restful.Request) execRequestParams {
+	return execRequestParams{
+		podNamespace:  req.PathParameter("podNamespace"),
+		podName:       req.PathParameter("podID"),
+		podUID:        types.UID(req.PathParameter("uid")),
+		containerName: req.PathParameter("containerName"),
+		cmd:           req.Request.URL.Query()[api.ExecCommandParam],
 	}
-	container = request.PathParameter("containerName")
-	return
+}
+
+type portForwardRequestParams struct {
+	podNamespace string
+	podName      string
+	podUID       types.UID
+}
+
+func getPortForwardRequestParams(req *restful.Request) portForwardRequestParams {
+	return portForwardRequestParams{
+		podNamespace: req.PathParameter("podNamespace"),
+		podName:      req.PathParameter("podID"),
+		podUID:       types.UID(req.PathParameter("uid")),
+	}
+}
+
+type responder struct{}
+
+func (r *responder) Error(w http.ResponseWriter, req *http.Request, err error) {
+	klog.Errorf("Error while proxying request: %v", err)
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+// proxyStream proxies stream to url.
+func proxyStream(w http.ResponseWriter, r *http.Request, url *url.URL) {
+	// TODO(random-liu): Set MaxBytesPerSec to throttle the stream.
+	handler := proxy.NewUpgradeAwareHandler(url, nil /*transport*/, false /*wrapTransport*/, true /*upgradeRequired*/, &responder{})
+	handler.ServeHTTP(w, r)
 }
 
 // getAttach handles requests to attach to a container.
 func (s *Server) getAttach(request *restful.Request, response *restful.Response) {
-	podNamespace, podID, uid, container := getContainerCoordinates(request)
-	pod, ok := s.host.GetPodByName(podNamespace, podID)
+	params := getExecRequestParams(request)
+	streamOpts, err := remotecommandserver.NewOptions(request.Request)
+	if err != nil {
+		utilruntime.HandleError(err)
+		response.WriteError(http.StatusBadRequest, err)
+		return
+	}
+	pod, ok := s.host.GetPodByName(params.podNamespace, params.podName)
 	if !ok {
 		response.WriteError(http.StatusNotFound, fmt.Errorf("pod does not exist"))
 		return
 	}
 
-	remotecommand.ServeAttach(response.ResponseWriter,
-		request.Request,
-		s.host,
-		kubecontainer.GetPodFullName(pod),
-		uid,
-		container,
-		s.host.StreamingConnectionIdleTimeout(),
-		remotecommand.DefaultStreamCreationTimeout,
-		remotecommand.SupportedStreamingProtocols)
+	podFullName := kubecontainer.GetPodFullName(pod)
+	url, err := s.host.GetAttach(podFullName, params.podUID, params.containerName, *streamOpts)
+	if err != nil {
+		streaming.WriteError(err, response.ResponseWriter)
+		return
+	}
+
+	if s.redirectContainerStreaming {
+		http.Redirect(response.ResponseWriter, request.Request, url.String(), http.StatusFound)
+		return
+	}
+	proxyStream(response.ResponseWriter, request.Request, url)
 }
 
 // getExec handles requests to run a command inside a container.
 func (s *Server) getExec(request *restful.Request, response *restful.Response) {
-	podNamespace, podID, uid, container := getContainerCoordinates(request)
-	pod, ok := s.host.GetPodByName(podNamespace, podID)
+	params := getExecRequestParams(request)
+	streamOpts, err := remotecommandserver.NewOptions(request.Request)
+	if err != nil {
+		utilruntime.HandleError(err)
+		response.WriteError(http.StatusBadRequest, err)
+		return
+	}
+	pod, ok := s.host.GetPodByName(params.podNamespace, params.podName)
 	if !ok {
 		response.WriteError(http.StatusNotFound, fmt.Errorf("pod does not exist"))
 		return
 	}
 
-	remotecommand.ServeExec(response.ResponseWriter,
-		request.Request,
-		s.host,
-		kubecontainer.GetPodFullName(pod),
-		uid,
-		container,
-		s.host.StreamingConnectionIdleTimeout(),
-		remotecommand.DefaultStreamCreationTimeout,
-		remotecommand.SupportedStreamingProtocols)
+	podFullName := kubecontainer.GetPodFullName(pod)
+	url, err := s.host.GetExec(podFullName, params.podUID, params.containerName, params.cmd, *streamOpts)
+	if err != nil {
+		streaming.WriteError(err, response.ResponseWriter)
+		return
+	}
+	if s.redirectContainerStreaming {
+		http.Redirect(response.ResponseWriter, request.Request, url.String(), http.StatusFound)
+		return
+	}
+	proxyStream(response.ResponseWriter, request.Request, url)
 }
 
 // getRun handles requests to run a command inside a container.
 func (s *Server) getRun(request *restful.Request, response *restful.Response) {
-	podNamespace, podID, uid, container := getContainerCoordinates(request)
-	pod, ok := s.host.GetPodByName(podNamespace, podID)
+	params := getExecRequestParams(request)
+	pod, ok := s.host.GetPodByName(params.podNamespace, params.podName)
 	if !ok {
 		response.WriteError(http.StatusNotFound, fmt.Errorf("pod does not exist"))
 		return
 	}
-	command := strings.Split(request.QueryParameter("cmd"), " ")
-	data, err := s.host.RunInContainer(kubecontainer.GetPodFullName(pod), uid, container, command)
+
+	// For legacy reasons, run uses different query param than exec.
+	params.cmd = strings.Split(request.QueryParameter("cmd"), " ")
+	data, err := s.host.RunInContainer(kubecontainer.GetPodFullName(pod), params.podUID, params.containerName, params.cmd)
 	if err != nil {
 		response.WriteError(http.StatusInternalServerError, err)
 		return
 	}
-	writeJsonResponse(response, data)
-}
-
-func getPodCoordinates(request *restful.Request) (namespace, pod string, uid types.UID) {
-	namespace = request.PathParameter("podNamespace")
-	pod = request.PathParameter("podID")
-	if uidStr := request.PathParameter("uid"); uidStr != "" {
-		uid = types.UID(uidStr)
-	}
-	return
+	writeJSONResponse(response, data)
 }
 
 // Derived from go-restful writeJSON.
-func writeJsonResponse(response *restful.Response, data []byte) {
+func writeJSONResponse(response *restful.Response, data []byte) {
 	if data == nil {
 		response.WriteHeader(http.StatusOK)
 		// do not write a nil representation
@@ -646,323 +849,159 @@ func writeJsonResponse(response *restful.Response, data []byte) {
 	response.Header().Set(restful.HEADER_ContentType, restful.MIME_JSON)
 	response.WriteHeader(http.StatusOK)
 	if _, err := response.Write(data); err != nil {
-		glog.Errorf("Error writing response: %v", err)
+		klog.Errorf("Error writing response: %v", err)
 	}
-}
-
-// PortForwarder knows how to forward content from a data stream to/from a port
-// in a pod.
-type PortForwarder interface {
-	// PortForwarder copies data between a data stream and a port in a pod.
-	PortForward(name string, uid types.UID, port uint16, stream io.ReadWriteCloser) error
 }
 
 // getPortForward handles a new restful port forward request. It determines the
 // pod name and uid and then calls ServePortForward.
 func (s *Server) getPortForward(request *restful.Request, response *restful.Response) {
-	podNamespace, podID, uid := getPodCoordinates(request)
-	pod, ok := s.host.GetPodByName(podNamespace, podID)
+	params := getPortForwardRequestParams(request)
+
+	portForwardOptions, err := portforward.NewV4Options(request.Request)
+	if err != nil {
+		utilruntime.HandleError(err)
+		response.WriteError(http.StatusBadRequest, err)
+		return
+	}
+	pod, ok := s.host.GetPodByName(params.podNamespace, params.podName)
 	if !ok {
 		response.WriteError(http.StatusNotFound, fmt.Errorf("pod does not exist"))
 		return
 	}
+	if len(params.podUID) > 0 && pod.UID != params.podUID {
+		response.WriteError(http.StatusNotFound, fmt.Errorf("pod not found"))
+		return
+	}
 
-	podName := kubecontainer.GetPodFullName(pod)
-
-	ServePortForward(response.ResponseWriter, request.Request, s.host, podName, uid, s.host.StreamingConnectionIdleTimeout(), remotecommand.DefaultStreamCreationTimeout)
-}
-
-// ServePortForward handles a port forwarding request.  A single request is
-// kept alive as long as the client is still alive and the connection has not
-// been timed out due to idleness. This function handles multiple forwarded
-// connections; i.e., multiple `curl http://localhost:8888/` requests will be
-// handled by a single invocation of ServePortForward.
-func ServePortForward(w http.ResponseWriter, req *http.Request, portForwarder PortForwarder, podName string, uid types.UID, idleTimeout time.Duration, streamCreationTimeout time.Duration) {
-	supportedPortForwardProtocols := []string{portforward.PortForwardProtocolV1Name}
-	_, err := httpstream.Handshake(req, w, supportedPortForwardProtocols)
-	// negotiated protocol isn't currently used server side, but could be in the future
+	url, err := s.host.GetPortForward(pod.Name, pod.Namespace, pod.UID, *portForwardOptions)
 	if err != nil {
-		// Handshake writes the error to the client
-		utilruntime.HandleError(err)
+		streaming.WriteError(err, response.ResponseWriter)
 		return
 	}
-
-	streamChan := make(chan httpstream.Stream, 1)
-
-	glog.V(5).Infof("Upgrading port forward response")
-	upgrader := spdy.NewResponseUpgrader()
-	conn := upgrader.UpgradeResponse(w, req, portForwardStreamReceived(streamChan))
-	if conn == nil {
+	if s.redirectContainerStreaming {
+		http.Redirect(response.ResponseWriter, request.Request, url.String(), http.StatusFound)
 		return
 	}
-	defer conn.Close()
-
-	glog.V(5).Infof("(conn=%p) setting port forwarding streaming connection idle timeout to %v", conn, idleTimeout)
-	conn.SetIdleTimeout(idleTimeout)
-
-	h := &portForwardStreamHandler{
-		conn:                  conn,
-		streamChan:            streamChan,
-		streamPairs:           make(map[string]*portForwardStreamPair),
-		streamCreationTimeout: streamCreationTimeout,
-		pod:       podName,
-		uid:       uid,
-		forwarder: portForwarder,
-	}
-	h.run()
+	proxyStream(response.ResponseWriter, request.Request, url)
 }
 
-// portForwardStreamReceived is the httpstream.NewStreamHandler for port
-// forward streams. It checks each stream's port and stream type headers,
-// rejecting any streams that with missing or invalid values. Each valid
-// stream is sent to the streams channel.
-func portForwardStreamReceived(streams chan httpstream.Stream) func(httpstream.Stream, <-chan struct{}) error {
-	return func(stream httpstream.Stream, replySent <-chan struct{}) error {
-		// make sure it has a valid port header
-		portString := stream.Headers().Get(api.PortHeader)
-		if len(portString) == 0 {
-			return fmt.Errorf("%q header is required", api.PortHeader)
-		}
-		port, err := strconv.ParseUint(portString, 10, 16)
-		if err != nil {
-			return fmt.Errorf("unable to parse %q as a port: %v", portString, err)
-		}
-		if port < 1 {
-			return fmt.Errorf("port %q must be > 0", portString)
-		}
-
-		// make sure it has a valid stream type header
-		streamType := stream.Headers().Get(api.StreamType)
-		if len(streamType) == 0 {
-			return fmt.Errorf("%q header is required", api.StreamType)
-		}
-		if streamType != api.StreamTypeError && streamType != api.StreamTypeData {
-			return fmt.Errorf("invalid stream type %q", streamType)
-		}
-
-		streams <- stream
-		return nil
-	}
-}
-
-// portForwardStreamHandler is capable of processing multiple port forward
-// requests over a single httpstream.Connection.
-type portForwardStreamHandler struct {
-	conn                  httpstream.Connection
-	streamChan            chan httpstream.Stream
-	streamPairsLock       sync.RWMutex
-	streamPairs           map[string]*portForwardStreamPair
-	streamCreationTimeout time.Duration
-	pod                   string
-	uid                   types.UID
-	forwarder             PortForwarder
-}
-
-// getStreamPair returns a portForwardStreamPair for requestID. This creates a
-// new pair if one does not yet exist for the requestID. The returned bool is
-// true if the pair was created.
-func (h *portForwardStreamHandler) getStreamPair(requestID string) (*portForwardStreamPair, bool) {
-	h.streamPairsLock.Lock()
-	defer h.streamPairsLock.Unlock()
-
-	if p, ok := h.streamPairs[requestID]; ok {
-		glog.V(5).Infof("(conn=%p, request=%s) found existing stream pair", h.conn, requestID)
-		return p, false
+// getURLRootPath trims a URL path.
+// For paths in the format of "/metrics/xxx", "metrics/xxx" is returned;
+// For all other paths, the first part of the path is returned.
+func getURLRootPath(path string) string {
+	parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 3)
+	if len(parts) == 0 {
+		return path
 	}
 
-	glog.V(5).Infof("(conn=%p, request=%s) creating new stream pair", h.conn, requestID)
+	if parts[0] == "metrics" && len(parts) > 1 {
+		return fmt.Sprintf("%s/%s", parts[0], parts[1])
 
-	p := newPortForwardPair(requestID)
-	h.streamPairs[requestID] = p
-
-	return p, true
-}
-
-// monitorStreamPair waits for the pair to receive both its error and data
-// streams, or for the timeout to expire (whichever happens first), and then
-// removes the pair.
-func (h *portForwardStreamHandler) monitorStreamPair(p *portForwardStreamPair, timeout <-chan time.Time) {
-	select {
-	case <-timeout:
-		err := fmt.Errorf("(conn=%v, request=%s) timed out waiting for streams", h.conn, p.requestID)
-		utilruntime.HandleError(err)
-		p.printError(err.Error())
-	case <-p.complete:
-		glog.V(5).Infof("(conn=%v, request=%s) successfully received error and data streams", h.conn, p.requestID)
 	}
-	h.removeStreamPair(p.requestID)
+	return parts[0]
 }
 
-// hasStreamPair returns a bool indicating if a stream pair for requestID
-// exists.
-func (h *portForwardStreamHandler) hasStreamPair(requestID string) bool {
-	h.streamPairsLock.RLock()
-	defer h.streamPairsLock.RUnlock()
+var longRunningRequestPathMap = map[string]bool{
+	"exec":        true,
+	"attach":      true,
+	"portforward": true,
+	"debug":       true,
+}
 
-	_, ok := h.streamPairs[requestID]
+// isLongRunningRequest determines whether the request is long-running or not.
+func isLongRunningRequest(path string) bool {
+	_, ok := longRunningRequestPathMap[path]
 	return ok
 }
 
-// removeStreamPair removes the stream pair identified by requestID from streamPairs.
-func (h *portForwardStreamHandler) removeStreamPair(requestID string) {
-	h.streamPairsLock.Lock()
-	defer h.streamPairsLock.Unlock()
-
-	delete(h.streamPairs, requestID)
-}
-
-// requestID returns the request id for stream.
-func (h *portForwardStreamHandler) requestID(stream httpstream.Stream) string {
-	requestID := stream.Headers().Get(api.PortForwardRequestIDHeader)
-	if len(requestID) == 0 {
-		glog.V(5).Infof("(conn=%p) stream received without %s header", h.conn, api.PortForwardRequestIDHeader)
-		// If we get here, it's because the connection came from an older client
-		// that isn't generating the request id header
-		// (https://github.com/kubernetes/kubernetes/blob/843134885e7e0b360eb5441e85b1410a8b1a7a0c/pkg/client/unversioned/portforward/portforward.go#L258-L287)
-		//
-		// This is a best-effort attempt at supporting older clients.
-		//
-		// When there aren't concurrent new forwarded connections, each connection
-		// will have a pair of streams (data, error), and the stream IDs will be
-		// consecutive odd numbers, e.g. 1 and 3 for the first connection. Convert
-		// the stream ID into a pseudo-request id by taking the stream type and
-		// using id = stream.Identifier() when the stream type is error,
-		// and id = stream.Identifier() - 2 when it's data.
-		//
-		// NOTE: this only works when there are not concurrent new streams from
-		// multiple forwarded connections; it's a best-effort attempt at supporting
-		// old clients that don't generate request ids.  If there are concurrent
-		// new connections, it's possible that 1 connection gets streams whose IDs
-		// are not consecutive (e.g. 5 and 9 instead of 5 and 7).
-		streamType := stream.Headers().Get(api.StreamType)
-		switch streamType {
-		case api.StreamTypeError:
-			requestID = strconv.Itoa(int(stream.Identifier()))
-		case api.StreamTypeData:
-			requestID = strconv.Itoa(int(stream.Identifier()) - 2)
-		}
-
-		glog.V(5).Infof("(conn=%p) automatically assigning request ID=%q from stream type=%s, stream ID=%d", h.conn, requestID, streamType, stream.Identifier())
-	}
-	return requestID
-}
-
-// run is the main loop for the portForwardStreamHandler. It processes new
-// streams, invoking portForward for each complete stream pair. The loop exits
-// when the httpstream.Connection is closed.
-func (h *portForwardStreamHandler) run() {
-	glog.V(5).Infof("(conn=%p) waiting for port forward streams", h.conn)
-Loop:
-	for {
-		select {
-		case <-h.conn.CloseChan():
-			glog.V(5).Infof("(conn=%p) upgraded connection closed", h.conn)
-			break Loop
-		case stream := <-h.streamChan:
-			requestID := h.requestID(stream)
-			streamType := stream.Headers().Get(api.StreamType)
-			glog.V(5).Infof("(conn=%p, request=%s) received new stream of type %s", h.conn, requestID, streamType)
-
-			p, created := h.getStreamPair(requestID)
-			if created {
-				go h.monitorStreamPair(p, time.After(h.streamCreationTimeout))
-			}
-			if complete, err := p.add(stream); err != nil {
-				msg := fmt.Sprintf("error processing stream for request %s: %v", requestID, err)
-				utilruntime.HandleError(errors.New(msg))
-				p.printError(msg)
-			} else if complete {
-				go h.portForward(p)
-			}
-		}
-	}
-}
-
-// portForward invokes the portForwardStreamHandler's forwarder.PortForward
-// function for the given stream pair.
-func (h *portForwardStreamHandler) portForward(p *portForwardStreamPair) {
-	defer p.dataStream.Close()
-	defer p.errorStream.Close()
-
-	portString := p.dataStream.Headers().Get(api.PortHeader)
-	port, _ := strconv.ParseUint(portString, 10, 16)
-
-	glog.V(5).Infof("(conn=%p, request=%s) invoking forwarder.PortForward for port %s", h.conn, p.requestID, portString)
-	err := h.forwarder.PortForward(h.pod, h.uid, uint16(port), p.dataStream)
-	glog.V(5).Infof("(conn=%p, request=%s) done invoking forwarder.PortForward for port %s", h.conn, p.requestID, portString)
-
-	if err != nil {
-		msg := fmt.Errorf("error forwarding port %d to pod %s, uid %v: %v", port, h.pod, h.uid, err)
-		utilruntime.HandleError(msg)
-		fmt.Fprint(p.errorStream, msg.Error())
-	}
-}
-
-// portForwardStreamPair represents the error and data streams for a port
-// forwarding request.
-type portForwardStreamPair struct {
-	lock        sync.RWMutex
-	requestID   string
-	dataStream  httpstream.Stream
-	errorStream httpstream.Stream
-	complete    chan struct{}
-}
-
-// newPortForwardPair creates a new portForwardStreamPair.
-func newPortForwardPair(requestID string) *portForwardStreamPair {
-	return &portForwardStreamPair{
-		requestID: requestID,
-		complete:  make(chan struct{}),
-	}
-}
-
-// add adds the stream to the portForwardStreamPair. If the pair already
-// contains a stream for the new stream's type, an error is returned. add
-// returns true if both the data and error streams for this pair have been
-// received.
-func (p *portForwardStreamPair) add(stream httpstream.Stream) (bool, error) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	switch stream.Headers().Get(api.StreamType) {
-	case api.StreamTypeError:
-		if p.errorStream != nil {
-			return false, errors.New("error stream already assigned")
-		}
-		p.errorStream = stream
-	case api.StreamTypeData:
-		if p.dataStream != nil {
-			return false, errors.New("data stream already assigned")
-		}
-		p.dataStream = stream
-	}
-
-	complete := p.errorStream != nil && p.dataStream != nil
-	if complete {
-		close(p.complete)
-	}
-	return complete, nil
-}
-
-// printError writes s to p.errorStream if p.errorStream has been set.
-func (p *portForwardStreamPair) printError(s string) {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
-	if p.errorStream != nil {
-		fmt.Fprint(p.errorStream, s)
-	}
-}
+var statusesNoTracePred = httplog.StatusIsNot(
+	http.StatusOK,
+	http.StatusFound,
+	http.StatusMovedPermanently,
+	http.StatusTemporaryRedirect,
+	http.StatusBadRequest,
+	http.StatusNotFound,
+	http.StatusSwitchingProtocols,
+)
 
 // ServeHTTP responds to HTTP requests on the Kubelet.
 func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	defer httplog.NewLogged(req, &w).StacktraceWhen(
-		httplog.StatusIsNot(
-			http.StatusOK,
-			http.StatusMovedPermanently,
-			http.StatusTemporaryRedirect,
-			http.StatusNotFound,
-			http.StatusSwitchingProtocols,
-		),
-	).Log()
-	s.restfulCont.ServeHTTP(w, req)
+	handler := httplog.WithLogging(s.restfulCont, statusesNoTracePred)
+
+	// monitor http requests
+	var serverType string
+	if s.auth == nil {
+		serverType = "readonly"
+	} else {
+		serverType = "readwrite"
+	}
+
+	method, path := s.getMetricMethodBucket(req.Method), s.getMetricBucket(req.URL.Path)
+
+	longRunning := strconv.FormatBool(isLongRunningRequest(path))
+
+	servermetrics.HTTPRequests.WithLabelValues(method, path, serverType, longRunning).Inc()
+
+	servermetrics.HTTPInflightRequests.WithLabelValues(method, path, serverType, longRunning).Inc()
+	defer servermetrics.HTTPInflightRequests.WithLabelValues(method, path, serverType, longRunning).Dec()
+
+	startTime := time.Now()
+	defer servermetrics.HTTPRequestsDuration.WithLabelValues(method, path, serverType, longRunning).Observe(servermetrics.SinceInSeconds(startTime))
+
+	handler.ServeHTTP(w, req)
+}
+
+// prometheusHostAdapter adapts the HostInterface to the interface expected by the
+// cAdvisor prometheus collector.
+type prometheusHostAdapter struct {
+	host HostInterface
+}
+
+func (a prometheusHostAdapter) GetRequestedContainersInfo(containerName string, options cadvisorv2.RequestOptions) (map[string]*cadvisorapi.ContainerInfo, error) {
+	return a.host.GetRequestedContainersInfo(containerName, options)
+}
+func (a prometheusHostAdapter) GetVersionInfo() (*cadvisorapi.VersionInfo, error) {
+	return a.host.GetVersionInfo()
+}
+func (a prometheusHostAdapter) GetMachineInfo() (*cadvisorapi.MachineInfo, error) {
+	return a.host.GetCachedMachineInfo()
+}
+
+func containerPrometheusLabelsFunc(s stats.Provider) metrics.ContainerLabelsFunc {
+	// containerPrometheusLabels maps cAdvisor labels to prometheus labels.
+	return func(c *cadvisorapi.ContainerInfo) map[string]string {
+		// Prometheus requires that all metrics in the same family have the same labels,
+		// so we arrange to supply blank strings for missing labels
+		var name, image, podName, namespace, containerName string
+		if len(c.Aliases) > 0 {
+			name = c.Aliases[0]
+		}
+		image = c.Spec.Image
+		if v, ok := c.Spec.Labels[kubelettypes.KubernetesPodNameLabel]; ok {
+			podName = v
+		}
+		if v, ok := c.Spec.Labels[kubelettypes.KubernetesPodNamespaceLabel]; ok {
+			namespace = v
+		}
+		if v, ok := c.Spec.Labels[kubelettypes.KubernetesContainerNameLabel]; ok {
+			containerName = v
+		}
+		// Associate pod cgroup with pod so we have an accurate accounting of sandbox
+		if podName == "" && namespace == "" {
+			if pod, found := s.GetPodByCgroupfs(c.Name); found {
+				podName = pod.Name
+				namespace = pod.Namespace
+			}
+		}
+		set := map[string]string{
+			metrics.LabelID:    c.Name,
+			metrics.LabelName:  name,
+			metrics.LabelImage: image,
+			"pod":              podName,
+			"namespace":        namespace,
+			"container":        containerName,
+		}
+		return set
+	}
 }

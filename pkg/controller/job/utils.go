@@ -17,13 +17,15 @@ limitations under the License.
 package job
 
 import (
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/apis/batch"
+	batch "k8s.io/api/batch/v1"
+	"k8s.io/api/core/v1"
 )
 
+// IsJobFinished checks whether the given Job has finished execution.
+// It does not discriminate between successful and failed terminations.
 func IsJobFinished(j *batch.Job) bool {
 	for _, c := range j.Status.Conditions {
-		if (c.Type == batch.JobComplete || c.Type == batch.JobFailed) && c.Status == api.ConditionTrue {
+		if (c.Type == batch.JobComplete || c.Type == batch.JobFailed) && c.Status == v1.ConditionTrue {
 			return true
 		}
 	}

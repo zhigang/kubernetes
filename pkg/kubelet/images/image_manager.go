@@ -18,13 +18,17 @@ package images
 
 import (
 	"fmt"
+	"time"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/record"
+	dockerref "github.com/docker/distribution/reference"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/klog/v2"
+
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
-	"k8s.io/kubernetes/pkg/util/flowcontrol"
 )
 
 // imageManager provides the functionalities for image pulling.
@@ -38,6 +42,7 @@ type imageManager struct {
 
 var _ ImageManager = &imageManager{}
 
+// NewImageManager instantiates a new ImageManager object.
 func NewImageManager(recorder record.EventRecorder, imageService kubecontainer.ImageService, imageBackOff *flowcontrol.Backoff, serialized bool, qps float32, burst int) ImageManager {
 	imageService = throttleImagePulling(imageService, qps, burst)
 
@@ -57,13 +62,13 @@ func NewImageManager(recorder record.EventRecorder, imageService kubecontainer.I
 
 // shouldPullImage returns whether we should pull an image according to
 // the presence and pull policy of the image.
-func shouldPullImage(container *api.Container, imagePresent bool) bool {
-	if container.ImagePullPolicy == api.PullNever {
+func shouldPullImage(container *v1.Container, imagePresent bool) bool {
+	if container.ImagePullPolicy == v1.PullNever {
 		return false
 	}
 
-	if container.ImagePullPolicy == api.PullAlways ||
-		(container.ImagePullPolicy == api.PullIfNotPresent && (!imagePresent)) {
+	if container.ImagePullPolicy == v1.PullAlways ||
+		(container.ImagePullPolicy == v1.PullIfNotPresent && (!imagePresent)) {
 		return true
 	}
 
@@ -71,7 +76,7 @@ func shouldPullImage(container *api.Container, imagePresent bool) bool {
 }
 
 // records an event using ref, event msg.  log to glog using prefix, msg, logFn
-func (m *imageManager) logIt(ref *api.ObjectReference, eventtype, event, prefix, msg string, logFn func(args ...interface{})) {
+func (m *imageManager) logIt(ref *v1.ObjectReference, eventtype, event, prefix, msg string, logFn func(args ...interface{})) {
 	if ref != nil {
 		m.recorder.Event(ref, eventtype, event, msg)
 	} else {
@@ -79,54 +84,96 @@ func (m *imageManager) logIt(ref *api.ObjectReference, eventtype, event, prefix,
 	}
 }
 
-// EnsureImageExists pulls the image for the specified pod and container.
-func (m *imageManager) EnsureImageExists(pod *api.Pod, container *api.Container, pullSecrets []api.Secret) (error, string) {
-	logPrefix := fmt.Sprintf("%s/%s", pod.Name, container.Image)
+// EnsureImageExists pulls the image for the specified pod and container, and returns
+// (imageRef, error message, error).
+func (m *imageManager) EnsureImageExists(pod *v1.Pod, container *v1.Container, pullSecrets []v1.Secret, podSandboxConfig *runtimeapi.PodSandboxConfig) (string, string, error) {
+	logPrefix := fmt.Sprintf("%s/%s/%s", pod.Namespace, pod.Name, container.Image)
 	ref, err := kubecontainer.GenerateContainerRef(pod, container)
 	if err != nil {
-		glog.Errorf("Couldn't make a ref to pod %v, container %v: '%v'", pod.Name, container.Name, err)
+		klog.Errorf("Couldn't make a ref to pod %v, container %v: '%v'", pod.Name, container.Name, err)
 	}
 
-	spec := kubecontainer.ImageSpec{Image: container.Image}
-	present, err := m.imageService.IsImagePresent(spec)
+	// If the image contains no tag or digest, a default tag should be applied.
+	image, err := applyDefaultImageTag(container.Image)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to apply default image tag %q: %v", container.Image, err)
+		m.logIt(ref, v1.EventTypeWarning, events.FailedToInspectImage, logPrefix, msg, klog.Warning)
+		return "", msg, ErrInvalidImageName
+	}
+
+	var podAnnotations []kubecontainer.Annotation
+	for k, v := range pod.GetAnnotations() {
+		podAnnotations = append(podAnnotations, kubecontainer.Annotation{
+			Name:  k,
+			Value: v,
+		})
+	}
+
+	spec := kubecontainer.ImageSpec{
+		Image:       image,
+		Annotations: podAnnotations,
+	}
+	imageRef, err := m.imageService.GetImageRef(spec)
 	if err != nil {
 		msg := fmt.Sprintf("Failed to inspect image %q: %v", container.Image, err)
-		m.logIt(ref, api.EventTypeWarning, events.FailedToInspectImage, logPrefix, msg, glog.Warning)
-		return ErrImageInspect, msg
+		m.logIt(ref, v1.EventTypeWarning, events.FailedToInspectImage, logPrefix, msg, klog.Warning)
+		return "", msg, ErrImageInspect
 	}
 
+	present := imageRef != ""
 	if !shouldPullImage(container, present) {
 		if present {
 			msg := fmt.Sprintf("Container image %q already present on machine", container.Image)
-			m.logIt(ref, api.EventTypeNormal, events.PulledImage, logPrefix, msg, glog.Info)
-			return nil, ""
-		} else {
-			msg := fmt.Sprintf("Container image %q is not present with pull policy of Never", container.Image)
-			m.logIt(ref, api.EventTypeWarning, events.ErrImageNeverPullPolicy, logPrefix, msg, glog.Warning)
-			return ErrImageNeverPull, msg
+			m.logIt(ref, v1.EventTypeNormal, events.PulledImage, logPrefix, msg, klog.Info)
+			return imageRef, "", nil
 		}
+		msg := fmt.Sprintf("Container image %q is not present with pull policy of Never", container.Image)
+		m.logIt(ref, v1.EventTypeWarning, events.ErrImageNeverPullPolicy, logPrefix, msg, klog.Warning)
+		return "", msg, ErrImageNeverPull
 	}
 
 	backOffKey := fmt.Sprintf("%s_%s", pod.UID, container.Image)
 	if m.backOff.IsInBackOffSinceUpdate(backOffKey, m.backOff.Clock.Now()) {
 		msg := fmt.Sprintf("Back-off pulling image %q", container.Image)
-		m.logIt(ref, api.EventTypeNormal, events.BackOffPullImage, logPrefix, msg, glog.Info)
-		return ErrImagePullBackOff, msg
+		m.logIt(ref, v1.EventTypeNormal, events.BackOffPullImage, logPrefix, msg, klog.Info)
+		return "", msg, ErrImagePullBackOff
 	}
-	m.logIt(ref, api.EventTypeNormal, events.PullingImage, logPrefix, fmt.Sprintf("pulling image %q", container.Image), glog.Info)
-	errChan := make(chan error)
-	m.puller.pullImage(spec, pullSecrets, errChan)
-	if err := <-errChan; err != nil {
-		m.logIt(ref, api.EventTypeWarning, events.FailedToPullImage, logPrefix, fmt.Sprintf("Failed to pull image %q: %v", container.Image, err), glog.Warning)
+	m.logIt(ref, v1.EventTypeNormal, events.PullingImage, logPrefix, fmt.Sprintf("Pulling image %q", container.Image), klog.Info)
+	startTime := time.Now()
+	pullChan := make(chan pullResult)
+	m.puller.pullImage(spec, pullSecrets, pullChan, podSandboxConfig)
+	imagePullResult := <-pullChan
+	if imagePullResult.err != nil {
+		m.logIt(ref, v1.EventTypeWarning, events.FailedToPullImage, logPrefix, fmt.Sprintf("Failed to pull image %q: %v", container.Image, imagePullResult.err), klog.Warning)
 		m.backOff.Next(backOffKey, m.backOff.Clock.Now())
-		if err == RegistryUnavailable {
+		if imagePullResult.err == ErrRegistryUnavailable {
 			msg := fmt.Sprintf("image pull failed for %s because the registry is unavailable.", container.Image)
-			return err, msg
-		} else {
-			return ErrImagePull, err.Error()
+			return "", msg, imagePullResult.err
 		}
+
+		return "", imagePullResult.err.Error(), ErrImagePull
 	}
-	m.logIt(ref, api.EventTypeNormal, events.PulledImage, logPrefix, fmt.Sprintf("Successfully pulled image %q", container.Image), glog.Info)
+	m.logIt(ref, v1.EventTypeNormal, events.PulledImage, logPrefix, fmt.Sprintf("Successfully pulled image %q in %v", container.Image, time.Since(startTime)), klog.Info)
 	m.backOff.GC()
-	return nil, ""
+	return imagePullResult.imageRef, "", nil
+}
+
+// applyDefaultImageTag parses a docker image string, if it doesn't contain any tag or digest,
+// a default tag will be applied.
+func applyDefaultImageTag(image string) (string, error) {
+	named, err := dockerref.ParseNormalizedNamed(image)
+	if err != nil {
+		return "", fmt.Errorf("couldn't parse image reference %q: %v", image, err)
+	}
+	_, isTagged := named.(dockerref.Tagged)
+	_, isDigested := named.(dockerref.Digested)
+	if !isTagged && !isDigested {
+		// we just concatenate the image name with the default tag here instead
+		// of using dockerref.WithTag(named, ...) because that would cause the
+		// image to be fully qualified as docker.io/$name if it's a short name
+		// (e.g. just busybox). We don't want that to happen to keep the CRI
+		// agnostic wrt image names and default hostnames.
+		image = image + ":latest"
+	}
+	return image, nil
 }
